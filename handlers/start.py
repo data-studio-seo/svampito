@@ -3,7 +3,7 @@ Onboarding flow: /start → welcome → wake time → categories → category se
 Uses ConversationHandler with states.
 """
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     ContextTypes, ConversationHandler, CommandHandler,
     CallbackQueryHandler, MessageHandler, filters
@@ -24,6 +24,19 @@ logger = logging.getLogger(__name__)
 (WELCOME_STATE, WAKE_TIME, CATEGORIES, CAT_SETUP,
  MED_NAME, MED_FREQ, MED_TIMES_SELECT, MED_TIMES_CUSTOM,
  MED_DURATION, MED_CONFIRM) = range(10)
+
+
+def get_persistent_keyboard():
+    """Persistent keyboard always visible at the bottom of the chat."""
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("📋 Oggi"), KeyboardButton("📅 Domani")],
+            [KeyboardButton("📊 Settimana"), KeyboardButton("💊 Farmaci")],
+            [KeyboardButton("⚙️ Impostazioni"), KeyboardButton("❓ Help")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -572,25 +585,34 @@ async def med_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def _finish_onboarding(query, context):
-    """Mark onboarding as done."""
+    """Mark onboarding as done and show persistent keyboard."""
     async with async_session() as session:
         user = await session.get(User, query.from_user.id)
         if user:
             user.onboarding_done = True
             await session.commit()
 
+    # edit_message_text can't send ReplyKeyboardMarkup, so we send a new message
     await query.edit_message_text(ONBOARDING_DONE, parse_mode="Markdown")
+    await query.message.reply_text(
+        "⌨️ Ecco i tuoi comandi rapidi!",
+        reply_markup=get_persistent_keyboard()
+    )
 
 
 async def _finish_onboarding_msg(update, context):
-    """Mark onboarding done (from message context)."""
+    """Mark onboarding done (from message context) and show persistent keyboard."""
     async with async_session() as session:
         user = await session.get(User, update.effective_user.id)
         if user:
             user.onboarding_done = True
             await session.commit()
 
-    await update.message.reply_text(ONBOARDING_DONE, parse_mode="Markdown")
+    await update.message.reply_text(
+        ONBOARDING_DONE,
+        parse_mode="Markdown",
+        reply_markup=get_persistent_keyboard()
+    )
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
