@@ -2,7 +2,6 @@
 Handlers for utility commands: /oggi, /domani, /settimana, /lista, /farmaci,
 /scadenze, /fatto, /cancella, /silenzio, /export, /help, /impostazioni, /timezone.
 """
-from handlers.start import get_persistent_keyboard
 import json
 import logging
 from datetime import datetime, timedelta
@@ -17,8 +16,12 @@ from database import (
 )
 from services.messages import get_emoji, HELP_TEXT
 from services.scheduler import reschedule_reminder
+from handlers.start import get_persistent_keyboard
 
 logger = logging.getLogger(__name__)
+
+# Shortcut
+KB = get_persistent_keyboard()
 
 
 async def _get_user_tz(user_id: int) -> pytz.timezone:
@@ -65,7 +68,7 @@ async def cmd_oggi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reminders = await _get_reminders_in_range(update.effective_user.id, start, end)
 
     if not reminders:
-        await update.message.reply_text("📋 Oggi non hai nulla in programma!")
+        await update.message.reply_text("📋 Oggi non hai nulla in programma!", reply_markup=KB)
         return
 
     lines = ["📋 *Oggi:*\n"]
@@ -74,7 +77,7 @@ async def cmd_oggi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if line:
             lines.append(line)
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=KB)
 
 
 # --- /domani ---
@@ -87,7 +90,7 @@ async def cmd_domani(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reminders = await _get_reminders_in_range(update.effective_user.id, start, end)
 
     if not reminders:
-        await update.message.reply_text("📋 Domani non hai nulla in programma!")
+        await update.message.reply_text("📋 Domani non hai nulla in programma!", reply_markup=KB)
         return
 
     lines = ["📋 *Domani:*\n"]
@@ -96,7 +99,7 @@ async def cmd_domani(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if line:
             lines.append(line)
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=KB)
 
 
 # --- /settimana ---
@@ -109,7 +112,7 @@ async def cmd_settimana(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reminders = await _get_reminders_in_range(update.effective_user.id, start, end)
 
     if not reminders:
-        await update.message.reply_text("📋 Nessun reminder nei prossimi 7 giorni!")
+        await update.message.reply_text("📋 Nessun reminder nei prossimi 7 giorni!", reply_markup=KB)
         return
 
     lines = ["📋 *Prossimi 7 giorni:*\n"]
@@ -129,7 +132,7 @@ async def cmd_settimana(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if line:
             lines.append(f"  {line}")
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=KB)
 
 
 # --- /lista ---
@@ -145,7 +148,7 @@ async def cmd_lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reminders = result.scalars().all()
 
     if not reminders:
-        await update.message.reply_text("📋 Non hai reminder attivi.")
+        await update.message.reply_text("📋 Non hai reminder attivi.", reply_markup=KB)
         return
 
     tz = await _get_user_tz(update.effective_user.id)
@@ -155,7 +158,7 @@ async def cmd_lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if line:
             lines.append(line)
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=KB)
 
 
 # --- /farmaci ---
@@ -173,7 +176,7 @@ async def cmd_farmaci(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reminders = result.scalars().all()
 
     if not reminders:
-        await update.message.reply_text("💊 Nessun farmaco configurato.\n\nScrivimi il nome di un farmaco per aggiungerlo!")
+        await update.message.reply_text("💊 Nessun farmaco configurato.\n\nScrivimi il nome di un farmaco per aggiungerlo!", reply_markup=KB)
         return
 
     tz = await _get_user_tz(update.effective_user.id)
@@ -187,7 +190,7 @@ async def cmd_farmaci(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"💊 *{r.title}*")
         lines.append(f"   ⏰ {times_str.replace(',', ' · ')}{end_str}")
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=KB)
 
 
 # --- /scadenze ---
@@ -208,7 +211,7 @@ async def cmd_scadenze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reminders = result.scalars().all()
 
     if not reminders:
-        await update.message.reply_text("📄 Nessuna scadenza impostata.")
+        await update.message.reply_text("📄 Nessuna scadenza impostata.", reply_markup=KB)
         return
 
     tz = await _get_user_tz(update.effective_user.id)
@@ -218,7 +221,7 @@ async def cmd_scadenze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fire_local = pytz.UTC.localize(r.next_fire).astimezone(tz)
         lines.append(f"{emoji} *{r.title}* — {fire_local.strftime('%d/%m/%Y')}")
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=KB)
 
 
 # --- /fatto ---
@@ -235,7 +238,7 @@ async def cmd_fatto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reminder = result.scalar_one_or_none()
 
         if not reminder:
-            await update.message.reply_text("Non hai reminder attivi da completare.")
+            await update.message.reply_text("Non hai reminder attivi da completare.", reply_markup=KB)
             return
 
         log = ReminderLog(user_id=reminder.user_id, reminder_id=reminder.id, action="done")
@@ -243,7 +246,7 @@ async def cmd_fatto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reschedule_reminder(reminder, session)
         await session.commit()
 
-    await update.message.reply_text(f"✅ *{reminder.title}* completato!", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ *{reminder.title}* completato!", parse_mode="Markdown", reply_markup=KB)
 
 
 # --- /cancella ---
@@ -259,7 +262,7 @@ async def cmd_cancella(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reminders = result.scalars().all()
 
     if not reminders:
-        await update.message.reply_text("Non hai reminder da cancellare.")
+        await update.message.reply_text("Non hai reminder da cancellare.", reply_markup=KB)
         return
 
     buttons = []
@@ -282,7 +285,8 @@ async def cmd_silenzio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Usa: /silenzio 2h oppure /silenzio 30m\n"
             "Es: `/silenzio 2h`",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
+            reply_markup=KB
         )
         return
 
@@ -299,7 +303,7 @@ async def cmd_silenzio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["silent_until"] = datetime.utcnow() + timedelta(minutes=minutes)
 
     label = f"{minutes // 60} ore" if minutes >= 60 else f"{minutes} minuti"
-    await update.message.reply_text(f"🔇 Silenzio per {label}. Non ti disturbo!")
+    await update.message.reply_text(f"🔇 Silenzio per {label}. Non ti disturbo!", reply_markup=KB)
 
 
 # --- /timezone ---
@@ -322,7 +326,7 @@ async def cmd_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         pytz.timezone(tz_name)
     except pytz.UnknownTimeZoneError:
-        await update.message.reply_text("⚠️ Fuso orario non valido. Prova ad es. Europe/Rome")
+        await update.message.reply_text("⚠️ Fuso orario non valido. Prova ad es. Europe/Rome", reply_markup=KB)
         return
 
     async with async_session() as session:
@@ -331,7 +335,7 @@ async def cmd_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user.timezone = tz_name
             await session.commit()
 
-    await update.message.reply_text(f"✅ Fuso orario aggiornato: {tz_name}")
+    await update.message.reply_text(f"✅ Fuso orario aggiornato: {tz_name}", reply_markup=KB)
 
 
 async def tz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -356,7 +360,7 @@ async def cmd_impostazioni(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = await session.get(User, update.effective_user.id)
 
     if not user:
-        await update.message.reply_text("⚠️ Usa /start prima.")
+        await update.message.reply_text("⚠️ Usa /start prima.", reply_markup=KB)
         return
 
     morning = "✅ Attivo" if user.morning_summary else "❌ Disattivato"
@@ -405,7 +409,7 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reminders = result.scalars().all()
 
     if not reminders:
-        await update.message.reply_text("Non hai reminder da esportare.")
+        await update.message.reply_text("Non hai reminder da esportare.", reply_markup=KB)
         return
 
     data = []
@@ -430,4 +434,4 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- /help ---
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown", reply_markup=KB)
