@@ -3,6 +3,5 @@ builder = "nixpacks"
 
 [deploy]
 startCommand = "python bot.py"
-healthcheckPath = "/"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 5
