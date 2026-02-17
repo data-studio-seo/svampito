@@ -2,6 +2,7 @@
 Handlers for utility commands: /oggi, /domani, /settimana, /lista, /farmaci,
 /scadenze, /fatto, /cancella, /silenzio, /export, /help, /impostazioni, /timezone.
 """
+from handlers.start import get_persistent_keyboard
 import json
 import logging
 from datetime import datetime, timedelta
