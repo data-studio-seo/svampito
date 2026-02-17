@@ -1,6 +1,7 @@
 """
 Handles free-text messages to create reminders.
 Also handles quick confirm responses ("ok", "fatto", "sì").
+Also routes persistent keyboard button presses to the right commands.
 """
 import logging
 from datetime import datetime, timedelta
@@ -22,10 +23,38 @@ logger = logging.getLogger(__name__)
 # Quick confirm keywords
 QUICK_CONFIRM = {"ok", "fatto", "sì", "si", "presa", "preso", "done", "✅"}
 
+# Persistent keyboard button mapping
+KEYBOARD_COMMANDS = {
+    "📋 Oggi": "oggi",
+    "📅 Domani": "domani",
+    "📊 Settimana": "settimana",
+    "💊 Farmaci": "farmaci",
+    "⚙️ Impostazioni": "impostazioni",
+    "❓ Help": "help",
+}
+
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle any text message - either quick confirm or new reminder."""
+    """Handle any text message - keyboard buttons, quick confirm, or new reminder."""
     text = update.message.text.strip()
+
+    # Check if it's a persistent keyboard button
+    if text in KEYBOARD_COMMANDS:
+        from handlers.commands import (
+            cmd_oggi, cmd_domani, cmd_settimana,
+            cmd_farmaci, cmd_impostazioni, cmd_help
+        )
+        cmd_map = {
+            "oggi": cmd_oggi,
+            "domani": cmd_domani,
+            "settimana": cmd_settimana,
+            "farmaci": cmd_farmaci,
+            "impostazioni": cmd_impostazioni,
+            "help": cmd_help,
+        }
+        cmd = KEYBOARD_COMMANDS[text]
+        await cmd_map[cmd](update, context)
+        return
 
     # Check if it's a quick confirm
     if text.lower() in QUICK_CONFIRM:
