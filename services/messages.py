@@ -27,7 +27,7 @@ def get_emoji(category: str) -> str:
 # --- Welcome messages ---
 
 WELCOME = (
-    "👋 *Ciao! Sono NudgeBot.*\n\n"
+    "👋 *Ciao! Sono lo Svampito 👻.*\n\n"
     "Ti aiuto a ricordare tutto quello che la tua testa dimentica: "
     "scadenze, appuntamenti, bollette, compleanni, farmaci, abitudini.\n\n"
     "Scrivimi le cose come le diresti a un amico, tipo:\n"
