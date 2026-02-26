@@ -1,14 +1,18 @@
 """
 Natural language parser for Italian reminder input.
+Strategy: try LLM first (Groq/Llama 3), fallback to regex if unavailable.
 Extracts: action, date/time, recurrence, multiple times.
 """
 import re
+import logging
 from datetime import datetime, timedelta, time
 from typing import Optional
 import dateparser
 import pytz
 
 from database import ReminderCategory, RecurrenceType
+
+logger = logging.getLogger(__name__)
 
 
 class ParsedReminder:
@@ -75,8 +79,121 @@ class ParsedReminder:
         return lines
 
 
+def _llm_dict_to_parsed(data: dict, user_tz: str) -> ParsedReminder:
+    """Convert LLM JSON output to a ParsedReminder object."""
+    result = ParsedReminder()
+    tz = pytz.timezone(user_tz)
+    now = datetime.now(tz)
+
+    # Title
+    result.title = data.get("title", "").strip()
+    if result.title:
+        result.title = result.title[0].upper() + result.title[1:]
+
+    # Category
+    cat_map = {
+        "medicine": ReminderCategory.MEDICINE,
+        "birthday": ReminderCategory.BIRTHDAY,
+        "car": ReminderCategory.CAR,
+        "house": ReminderCategory.HOUSE,
+        "health": ReminderCategory.HEALTH,
+        "document": ReminderCategory.DOCUMENT,
+        "habit": ReminderCategory.HABIT,
+        "generic": ReminderCategory.GENERIC,
+    }
+    result.category = cat_map.get(data.get("category", "generic"), ReminderCategory.GENERIC)
+
+    # Recurrence
+    rec_map = {
+        "once": RecurrenceType.ONCE,
+        "daily": RecurrenceType.DAILY,
+        "weekly": RecurrenceType.WEEKLY,
+        "monthly": RecurrenceType.MONTHLY,
+        "every_other_day": RecurrenceType.EVERY_OTHER_DAY,
+    }
+    result.recurrence = rec_map.get(data.get("recurrence", "once"), RecurrenceType.ONCE)
+    result.recurrence_days = data.get("recurrence_days")
+
+    # Fire times (multi-orario)
+    fire_times = data.get("fire_times", [])
+    if fire_times and isinstance(fire_times, list):
+        result.fire_times = fire_times
+
+    # Date and time
+    date_str = data.get("date")
+    time_str = data.get("time")
+
+    if date_str and time_str:
+        try:
+            dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+            result.fire_datetime = tz.localize(dt)
+        except (ValueError, TypeError):
+            pass
+    elif date_str:
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            dt = dt.replace(hour=9, minute=0)
+            result.fire_datetime = tz.localize(dt)
+        except (ValueError, TypeError):
+            pass
+    elif time_str:
+        try:
+            h, m = map(int, time_str.split(":"))
+            dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            if dt <= now:
+                dt += timedelta(days=1)
+            result.fire_datetime = dt
+        except (ValueError, TypeError):
+            pass
+
+    # Default if no datetime parsed
+    if not result.fire_datetime:
+        if result.fire_times:
+            first_time = result.fire_times[0]
+            h, m = map(int, first_time.split(":"))
+            dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            if dt <= now:
+                dt += timedelta(days=1)
+            result.fire_datetime = dt
+        else:
+            tomorrow = now + timedelta(days=1)
+            result.fire_datetime = tomorrow.replace(hour=9, minute=0, second=0, microsecond=0)
+
+    # End date
+    end_date_str = data.get("end_date")
+    if end_date_str:
+        try:
+            result.end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
+        except (ValueError, TypeError):
+            pass
+
+    # Advance days
+    result.advance_days = data.get("advance_days", 0)
+
+    return result
+
+
+async def parse_reminder_async(text: str, user_tz: str = "Europe/Rome") -> ParsedReminder:
+    """
+    Parse reminder text: LLM first, regex fallback.
+    This is the async version that tries Groq.
+    """
+    try:
+        from services.llm import parse_with_llm
+        llm_result = await parse_with_llm(text, user_tz)
+
+        if llm_result and llm_result.get("title"):
+            logger.info(f"LLM parsing succeeded for: {text[:50]}")
+            return _llm_dict_to_parsed(llm_result, user_tz)
+    except Exception as e:
+        logger.warning(f"LLM parsing failed, using regex fallback: {e}")
+
+    # Fallback to regex parser
+    return parse_reminder(text, user_tz)
+
+
 def parse_reminder(text: str, user_tz: str = "Europe/Rome") -> ParsedReminder:
-    """Parse free-text Italian input into a structured reminder."""
+    """Parse free-text Italian input into a structured reminder (regex-based)."""
     result = ParsedReminder()
     tz = pytz.timezone(user_tz)
     now = datetime.now(tz)
@@ -153,7 +270,6 @@ def parse_reminder(text: str, user_tz: str = "Europe/Rome") -> ParsedReminder:
 
     # --- Use dateparser for date/time extraction ---
     if not result.fire_datetime:
-        # Try to parse date/time from the text
         settings = {
             "PREFER_DATES_FROM": "future",
             "TIMEZONE": user_tz,
@@ -161,7 +277,6 @@ def parse_reminder(text: str, user_tz: str = "Europe/Rome") -> ParsedReminder:
             "PARSERS": ["relative-time", "absolute-time", "custom-formats"],
         }
 
-        # Try specific time patterns first
         time_match = re.search(r"(?:alle?\s+)?(\d{1,2})[:.:](\d{2})", cleaned)
         single_time_match = re.search(r"alle?\s+(\d{1,2})(?!\d)", cleaned)
 
@@ -184,18 +299,15 @@ def parse_reminder(text: str, user_tz: str = "Europe/Rome") -> ParsedReminder:
 
     # --- Default times ---
     if not result.fire_datetime:
-        # Default: tomorrow at 9:00
         tomorrow = now + timedelta(days=1)
         result.fire_datetime = tomorrow.replace(hour=9, minute=0, second=0, microsecond=0)
 
     if result.fire_times and result.fire_datetime:
-        # For multi-time, set fire_datetime to the first time today/tomorrow
         first_time = result.fire_times[0]
         h, m = map(int, first_time.split(":"))
         result.fire_datetime = result.fire_datetime.replace(hour=h, minute=m, second=0)
 
     # --- Extract title (the remaining action text) ---
-    # Remove time/date fragments
     title = cleaned
     time_fragments = [
         r"alle?\s+\d{1,2}([:.]\d{2})?",
@@ -210,10 +322,8 @@ def parse_reminder(text: str, user_tz: str = "Europe/Rome") -> ParsedReminder:
     for frag in time_fragments:
         title = re.sub(frag, "", title).strip()
 
-    # Clean up extra whitespace and punctuation
     title = re.sub(r"\s+", " ", title).strip(" ,.-")
 
-    # Capitalize first letter
     if title:
         title = title[0].upper() + title[1:]
 
