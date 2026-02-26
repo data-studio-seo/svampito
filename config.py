@@ -7,6 +7,10 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 PORT = int(os.environ.get("PORT", 8443))
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")  # e.g. https://nudgebot-xxx.up.railway.app
 
+# Groq LLM (free tier)
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+
 # Defaults
 DEFAULT_WAKE_HOUR = 8
 DEFAULT_SLEEP_HOUR = 23

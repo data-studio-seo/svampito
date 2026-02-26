@@ -4,3 +4,4 @@ asyncpg==0.30.0
 APScheduler==3.10.4
 dateparser==1.2.0
 pytz==2024.2
+groq==0.25.0
