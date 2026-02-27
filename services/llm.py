@@ -13,8 +13,6 @@ import pytz
 
 logger = logging.getLogger(__name__)
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # System prompt for extracting reminder data from Italian text
@@ -56,8 +54,15 @@ async def parse_with_llm(text: str, user_tz: str = "Europe/Rome") -> Optional[di
     Parse a reminder text using Groq LLM via async HTTP.
     Returns parsed dict or None if LLM is unavailable/fails.
     """
-    if not GROQ_API_KEY:
-        logger.warning("GROQ_API_KEY not set, skipping LLM parsing")
+    # Read at call time, not import time!
+    api_key = os.environ.get("GROQ_API_KEY", "").strip()
+    model = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant").strip()
+
+    if not api_key:
+        # Log all env vars starting with GROQ for debugging
+        groq_vars = {k: v[:10] + "..." for k, v in os.environ.items() if "GROQ" in k.upper()}
+        logger.warning(f"GROQ_API_KEY not set or empty. GROQ env vars found: {groq_vars}")
+        logger.warning(f"All env var names: {sorted(os.environ.keys())}")
         return None
 
     try:
@@ -74,7 +79,7 @@ async def parse_with_llm(text: str, user_tz: str = "Europe/Rome") -> Optional[di
         )
 
         payload = {
-            "model": GROQ_MODEL,
+            "model": model,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
@@ -85,11 +90,11 @@ async def parse_with_llm(text: str, user_tz: str = "Europe/Rome") -> Optional[di
         }
 
         headers = {
-            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
 
-        logger.info(f"Calling Groq API with model={GROQ_MODEL} for: {text[:60]}")
+        logger.info(f"Calling Groq API with model={model}, key={api_key[:8]}... for: {text[:60]}")
 
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(GROQ_URL, json=payload, headers=headers)
@@ -112,7 +117,7 @@ async def parse_with_llm(text: str, user_tz: str = "Europe/Rome") -> Optional[di
             logger.warning("LLM returned empty title")
             return None
 
-        logger.info(f"LLM parsing succeeded: title='{parsed.get('title')}', date={parsed.get('date')}, time={parsed.get('time')}")
+        logger.info(f"LLM parsing OK: title='{parsed.get('title')}', date={parsed.get('date')}, time={parsed.get('time')}")
         return parsed
 
     except httpx.TimeoutException:
