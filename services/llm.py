@@ -1,6 +1,6 @@
 """
-LLM service using Groq API (free tier) with Llama 3 for natural language understanding.
-Parses Italian text into structured reminder data.
+LLM service using Groq API (free tier) for natural language understanding.
+Uses httpx for async HTTP calls (no blocking the event loop).
 """
 import json
 import logging
@@ -8,10 +8,14 @@ import os
 from datetime import datetime
 from typing import Optional
 
+import httpx
+import pytz
+
 logger = logging.getLogger(__name__)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # System prompt for extracting reminder data from Italian text
 SYSTEM_PROMPT = """Sei Svampito, un assistente per reminder. Estrai i dati strutturati dal messaggio dell'utente italiano.
@@ -25,7 +29,7 @@ Il JSON deve avere questa struttura:
   "time": "HH:MM o null se non specificato",
   "recurrence": "once|daily|weekly|monthly|every_other_day",
   "recurrence_days": "mon,tue,wed,thu,fri,sat,sun o null (solo per weekly)",
-  "fire_times": ["HH:MM", "HH:MM"] o [] (per multi-orario tipo farmaci),
+  "fire_times": ["HH:MM", "HH:MM"],
   "category": "medicine|birthday|car|house|health|document|habit|generic",
   "end_date": "YYYY-MM-DD o null",
   "advance_days": 0
@@ -34,32 +38,30 @@ Il JSON deve avere questa struttura:
 Regole:
 - Il "title" deve essere l'AZIONE da fare, pulita da date/orari. Prima lettera maiuscola.
 - Se l'utente dice "domani", calcola la data corretta basandoti sulla data corrente.
+- Se dice "il prossimo mercoledì", calcola la data del prossimo mercoledì.
 - Se dice "ogni lunedì e giovedì", recurrence="weekly", recurrence_days="mon,thu"
 - Se dice "alle 8, 14 e 21", fire_times=["08:00","14:00","21:00"], recurrence="daily"
 - Se dice "tra 2 ore", calcola l'orario basandoti sull'ora corrente.
-- Rileva la categoria dal contesto (farmaci, dentista, bolletta, ecc.)
-- Se non c'è data, metti date=null (il sistema metterà domani alle 9)
-- Se non c'è orario, metti time=null (il sistema metterà 09:00)
+- Se dice "verso le 10", time="10:00"
+- Rileva la categoria dal contesto (farmaci→medicine, dentista→health, bolletta→house, meccanico→car, ecc.)
+- Se non c'è data, metti date=null
+- Se non c'è orario, metti time=null
+- fire_times è un array vuoto [] se c'è un solo orario (usa "time" per quello)
 - advance_days: per scadenze documenti=90, auto=30, bollette=5, visite=3, compleanni=3, altri=0
 """
 
 
 async def parse_with_llm(text: str, user_tz: str = "Europe/Rome") -> Optional[dict]:
     """
-    Parse a reminder text using Groq LLM.
+    Parse a reminder text using Groq LLM via async HTTP.
     Returns parsed dict or None if LLM is unavailable/fails.
     """
     if not GROQ_API_KEY:
-        logger.debug("GROQ_API_KEY not set, skipping LLM parsing")
+        logger.warning("GROQ_API_KEY not set, skipping LLM parsing")
         return None
 
     try:
-        from groq import Groq
-
-        client = Groq(api_key=GROQ_API_KEY)
-
         # Build context with current date/time
-        import pytz
         tz = pytz.timezone(user_tz)
         now = datetime.now(tz)
         day_names = ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"]
@@ -71,19 +73,36 @@ async def parse_with_llm(text: str, user_tz: str = "Europe/Rome") -> Optional[di
             f"Messaggio utente: {text}"
         )
 
-        chat_completion = client.chat.completions.create(
-            messages=[
+        payload = {
+            "model": GROQ_MODEL,
+            "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
             ],
-            model=GROQ_MODEL,
-            temperature=0.1,
-            max_tokens=500,
-            response_format={"type": "json_object"},
-        )
+            "temperature": 0.1,
+            "max_tokens": 500,
+            "response_format": {"type": "json_object"},
+        }
 
-        response_text = chat_completion.choices[0].message.content.strip()
-        logger.info(f"LLM response: {response_text}")
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        logger.info(f"Calling Groq API with model={GROQ_MODEL} for: {text[:60]}")
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(GROQ_URL, json=payload, headers=headers)
+
+        logger.info(f"Groq API response status: {response.status_code}")
+
+        if response.status_code != 200:
+            logger.error(f"Groq API error {response.status_code}: {response.text[:200]}")
+            return None
+
+        data = response.json()
+        response_text = data["choices"][0]["message"]["content"].strip()
+        logger.info(f"LLM raw response: {response_text[:300]}")
 
         # Parse JSON
         parsed = json.loads(response_text)
@@ -93,14 +112,15 @@ async def parse_with_llm(text: str, user_tz: str = "Europe/Rome") -> Optional[di
             logger.warning("LLM returned empty title")
             return None
 
+        logger.info(f"LLM parsing succeeded: title='{parsed.get('title')}', date={parsed.get('date')}, time={parsed.get('time')}")
         return parsed
 
-    except ImportError:
-        logger.warning("groq package not installed")
+    except httpx.TimeoutException:
+        logger.error("Groq API timeout after 10s")
         return None
     except json.JSONDecodeError as e:
         logger.error(f"LLM returned invalid JSON: {e}")
         return None
     except Exception as e:
-        logger.error(f"LLM parsing error: {e}")
+        logger.error(f"LLM parsing error: {type(e).__name__}: {e}")
         return None
