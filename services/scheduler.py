@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler()
 _bot = None
 
+# Track last sent reminder per user: {user_id: {"reminder_id": int, "sent_at": datetime}}
+# Used for contextual replies (user responds to a reminder with text/voice)
+last_sent_reminders: dict[int, dict] = {}
+
 
 def init_scheduler(bot):
     """Initialize scheduler with bot reference."""
@@ -88,6 +92,13 @@ async def check_reminders():
                 )
                 reminder.nudge_count = 1
                 reminder.last_nudge_at = now_utc
+                # Track for contextual text/voice replies
+                last_sent_reminders[reminder.user_id] = {
+                    "reminder_id": reminder.id,
+                    "title": reminder.title,
+                    "category": reminder.category,
+                    "sent_at": now_utc,
+                }
                 await session.commit()
             except Exception as e:
                 logger.error(f"Failed to send reminder {reminder.id}: {e}")
@@ -150,6 +161,13 @@ async def check_nudges():
                     )
                     reminder.nudge_count += 1
                     reminder.last_nudge_at = now_utc
+                    # Track for contextual replies
+                    last_sent_reminders[reminder.user_id] = {
+                        "reminder_id": reminder.id,
+                        "title": reminder.title,
+                        "category": reminder.category,
+                        "sent_at": now_utc,
+                    }
                     await session.commit()
                 except Exception as e:
                     logger.error(f"Failed to send nudge for {reminder.id}: {e}")

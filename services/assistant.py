@@ -1,6 +1,9 @@
 """
 Assistant service: the brain of Svampito.
 Takes user message → loads context → calls LLM → executes action → returns response.
+
+Supports contextual replies: when the bot sends a reminder and the user replies
+with text/voice within 15 minutes, the assistant handles it in context.
 """
 import logging
 from datetime import datetime, timedelta
@@ -19,6 +22,9 @@ from services.parser import parse_reminder, ParsedReminder, format_confirmation
 from services.messages import get_emoji
 
 logger = logging.getLogger(__name__)
+
+# Max time (minutes) to consider a reply as contextual to a sent reminder
+REPLY_CONTEXT_WINDOW = 15
 
 
 @dataclass
@@ -114,6 +120,22 @@ def _format_reminder_line(r: Reminder, tz) -> Optional[str]:
     return f"{emoji} {r.title} _({time_str})_"
 
 
+def _get_recent_reminder_context(user_id: int) -> Optional[dict]:
+    """Check if there's a recently sent reminder for this user."""
+    from services.scheduler import last_sent_reminders
+
+    ctx = last_sent_reminders.get(user_id)
+    if not ctx:
+        return None
+
+    # Check if within context window
+    age_minutes = (datetime.utcnow() - ctx["sent_at"]).total_seconds() / 60
+    if age_minutes > REPLY_CONTEXT_WINDOW:
+        return None
+
+    return ctx
+
+
 # ─────────────────────────────────────────────
 # Main entry point
 # ─────────────────────────────────────────────
@@ -133,11 +155,14 @@ async def process_message(user_id: int, chat_id: int, text: str, first_name: str
     tz = pytz.timezone(user.timezone if user else "Europe/Rome")
     tz_name = user.timezone if user else "Europe/Rome"
 
+    # Check for recent reminder context
+    recent_ctx = _get_recent_reminder_context(user_id)
+
     # Load active reminders for LLM context
     active_reminders = await _get_active_reminders(user_id, tz)
 
     # Call LLM to classify intent
-    llm_result = await classify_and_parse(text, tz_name, active_reminders)
+    llm_result = await classify_and_parse(text, tz_name, active_reminders, recent_ctx)
 
     # Fallback: if LLM fails, try to create a reminder with regex parser
     if not llm_result:
@@ -159,6 +184,8 @@ async def process_message(user_id: int, chat_id: int, text: str, first_name: str
         return await _handle_modify(user_id, data, tz)
     elif intent == "done":
         return await _handle_done(user_id, data)
+    elif intent == "reminder_reply":
+        return await _handle_reminder_reply(user_id, data, tz_name)
     elif intent == "chat":
         return AssistantResponse(text=data.get("response", "Ciao! Scrivimi un reminder 😊"))
     else:
@@ -405,6 +432,94 @@ async def _handle_done(user_id: int, data: dict) -> AssistantResponse:
             await reschedule_reminder(r, session)
             await session.commit()
 
+    # Clear context after completing
+    from services.scheduler import last_sent_reminders
+    last_sent_reminders.pop(user_id, None)
+
     return AssistantResponse(
         text=f"✅ *{reminder.title}* — fatto!"
     )
+
+
+async def _handle_reminder_reply(user_id: int, data: dict, tz_name: str) -> AssistantResponse:
+    """
+    Handle contextual reply to a recently sent reminder.
+    Actions: done, snooze (with minutes), skip, tomorrow.
+    """
+    from services.scheduler import reschedule_reminder, last_sent_reminders
+
+    action = data.get("action", "done")
+    snooze_minutes = data.get("snooze_minutes", 30)
+    reminder_id = data.get("reminder_id")
+
+    if not reminder_id:
+        return AssistantResponse(text="🤔 Non ho capito a quale reminder ti riferisci.")
+
+    async with async_session() as session:
+        reminder = await session.get(Reminder, reminder_id)
+        if not reminder or reminder.user_id != user_id:
+            return AssistantResponse(text="⚠️ Reminder non trovato.")
+
+        user = await session.get(User, user_id)
+        tz = pytz.timezone(user.timezone if user else "Europe/Rome")
+        emoji = get_emoji(reminder.category)
+
+        if action == "done":
+            log = ReminderLog(user_id=user_id, reminder_id=reminder.id, action="done")
+            session.add(log)
+            await reschedule_reminder(reminder, session)
+            await session.commit()
+            last_sent_reminders.pop(user_id, None)
+            return AssistantResponse(text=f"✅ *{reminder.title}* — fatto!")
+
+        elif action == "snooze":
+            reminder.next_fire = datetime.utcnow() + timedelta(minutes=snooze_minutes)
+            reminder.nudge_count = 0
+            reminder.last_nudge_at = None
+            reminder.snooze_count += 1
+            log = ReminderLog(user_id=user_id, reminder_id=reminder.id, action="snoozed")
+            session.add(log)
+            await session.commit()
+            last_sent_reminders.pop(user_id, None)
+
+            if snooze_minutes >= 60:
+                label = f"{snooze_minutes // 60} ora" if snooze_minutes == 60 else f"{snooze_minutes // 60} ore"
+            else:
+                label = f"{snooze_minutes} minuti"
+            return AssistantResponse(
+                text=f"⏰ Ok, ti ricordo {emoji} *{reminder.title}* tra {label}!"
+            )
+
+        elif action == "skip":
+            log = ReminderLog(user_id=user_id, reminder_id=reminder.id, action="skipped")
+            session.add(log)
+            await reschedule_reminder(reminder, session)
+            await session.commit()
+            last_sent_reminders.pop(user_id, None)
+
+            # Show when next fire is if recurring
+            if reminder.status == ReminderStatus.ACTIVE and reminder.next_fire:
+                next_local = pytz.UTC.localize(reminder.next_fire).astimezone(tz)
+                return AssistantResponse(
+                    text=f"⏭ {emoji} *{reminder.title}* saltato per oggi. "
+                         f"Prossimo: {next_local.strftime('%d/%m alle %H:%M')}."
+                )
+            return AssistantResponse(text=f"⏭ {emoji} *{reminder.title}* saltato!")
+
+        elif action == "tomorrow":
+            current_fire = pytz.UTC.localize(reminder.next_fire).astimezone(tz)
+            tomorrow = current_fire + timedelta(days=1)
+            reminder.next_fire = tomorrow.astimezone(pytz.UTC).replace(tzinfo=None)
+            reminder.nudge_count = 0
+            reminder.last_nudge_at = None
+            reminder.snooze_count += 1
+            log = ReminderLog(user_id=user_id, reminder_id=reminder.id, action="snoozed")
+            session.add(log)
+            await session.commit()
+            last_sent_reminders.pop(user_id, None)
+            return AssistantResponse(
+                text=f"📅 {emoji} *{reminder.title}* spostato a domani ({tomorrow.strftime('%H:%M')})."
+            )
+
+        else:
+            return AssistantResponse(text="🤔 Non ho capito cosa vuoi fare con questo reminder.")
