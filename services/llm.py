@@ -1,5 +1,7 @@
 """
 LLM service using Groq API (free tier) for natural language understanding.
+- parse_with_llm: text → structured reminder JSON (Llama 3)
+- transcribe_audio: audio bytes → text (Whisper Large v3)
 Uses httpx for async HTTP calls (no blocking the event loop).
 """
 import json
@@ -13,7 +15,8 @@ import pytz
 
 logger = logging.getLogger(__name__)
 
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_AUDIO_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 
 SYSTEM_PROMPT = """Sei Svampito, un assistente per reminder. Estrai i dati strutturati dal messaggio dell'utente italiano.
 
@@ -123,6 +126,10 @@ Output: {"title":"Rinnovo passaporto","date":"2026-06-20","time":"09:00","recurr
 """
 
 
+# ─────────────────────────────────────────────
+# Text → Structured Reminder (Llama 3)
+# ─────────────────────────────────────────────
+
 async def parse_with_llm(text: str, user_tz: str = "Europe/Rome") -> Optional[dict]:
     """
     Parse a reminder text using Groq LLM via async HTTP.
@@ -167,7 +174,7 @@ async def parse_with_llm(text: str, user_tz: str = "Europe/Rome") -> Optional[di
         logger.info(f"Calling Groq API with model={model} for: {text[:60]}")
 
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(GROQ_URL, json=payload, headers=headers)
+            response = await client.post(GROQ_CHAT_URL, json=payload, headers=headers)
 
         logger.info(f"Groq API response status: {response.status_code}")
 
@@ -198,4 +205,73 @@ async def parse_with_llm(text: str, user_tz: str = "Europe/Rome") -> Optional[di
         return None
     except Exception as e:
         logger.error(f"LLM parsing error: {type(e).__name__}: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────
+# Audio → Text (Whisper Large v3)
+# ─────────────────────────────────────────────
+
+async def transcribe_audio(audio_bytes: bytes, filename: str = "voice.ogg") -> Optional[str]:
+    """
+    Transcribe audio using Groq Whisper API.
+    Returns transcribed text or None if fails.
+    
+    Args:
+        audio_bytes: raw audio file bytes (ogg/opus from Telegram)
+        filename: filename with extension for content-type detection
+    """
+    api_key = os.environ.get("GROQ_API_KEY", "").strip()
+    whisper_model = os.environ.get("GROQ_WHISPER_MODEL", "whisper-large-v3").strip()
+
+    if not api_key:
+        logger.warning("GROQ_API_KEY not set, cannot transcribe audio")
+        return None
+
+    try:
+        logger.info(f"Transcribing audio ({len(audio_bytes)} bytes) with {whisper_model}")
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+        }
+
+        # Multipart form data for audio upload
+        files = {
+            "file": (filename, audio_bytes, "audio/ogg"),
+        }
+        form_data = {
+            "model": whisper_model,
+            "language": "it",
+            "response_format": "json",
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                GROQ_AUDIO_URL,
+                headers=headers,
+                files=files,
+                data=form_data,
+            )
+
+        logger.info(f"Whisper API response status: {response.status_code}")
+
+        if response.status_code != 200:
+            logger.error(f"Whisper API error {response.status_code}: {response.text[:200]}")
+            return None
+
+        data = response.json()
+        text = data.get("text", "").strip()
+
+        if not text:
+            logger.warning("Whisper returned empty transcription")
+            return None
+
+        logger.info(f"Transcription OK: '{text[:100]}'")
+        return text
+
+    except httpx.TimeoutException:
+        logger.error("Whisper API timeout after 30s")
+        return None
+    except Exception as e:
+        logger.error(f"Whisper transcription error: {type(e).__name__}: {e}")
         return None
