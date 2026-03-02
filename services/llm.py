@@ -1,6 +1,6 @@
 """
 LLM service using Groq API (free tier) for natural language understanding.
-- parse_with_llm: text → structured reminder JSON (Llama 3)
+- classify_and_parse: text + context → intent + structured data (Llama 3)
 - transcribe_audio: audio bytes → text (Whisper Large v3)
 Uses httpx for async HTTP calls (no blocking the event loop).
 """
@@ -18,129 +18,182 @@ logger = logging.getLogger(__name__)
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_AUDIO_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 
-SYSTEM_PROMPT = """Sei Svampito, un assistente per reminder. Estrai i dati strutturati dal messaggio dell'utente italiano.
+SYSTEM_PROMPT = """Sei Svampito, un assistente per reminder su Telegram. Ricevi il messaggio dell'utente e la lista dei suoi reminder attivi.
+
+Devi decidere cosa vuole l'utente e rispondere con un JSON.
 
 Rispondi SOLO con un JSON valido, senza markdown, senza testo aggiuntivo.
 
-Schema JSON:
+INTENT POSSIBILI:
+
+1. "create" — l'utente vuole creare un nuovo reminder
+2. "query" — l'utente vuole sapere cosa ha in programma (oggi, domani, settimana, ecc.)
+3. "delete" — l'utente vuole cancellare un reminder esistente
+4. "modify" — l'utente vuole modificare/spostare un reminder esistente
+5. "done" — l'utente dice di aver fatto qualcosa
+6. "chat" — l'utente sta chiacchierando, saluta, o fa una domanda generica
+
+SCHEMA RISPOSTA:
+
+Per "create":
 {
-  "title": "azione da fare, pulita da date/orari, prima lettera maiuscola",
-  "date": "YYYY-MM-DD o null",
-  "time": "HH:MM o null",
-  "recurrence": "once|daily|weekly|monthly|every_other_day",
-  "recurrence_days": "mon,tue,wed,thu,fri,sat,sun o null",
-  "fire_times": [],
-  "category": "medicine|birthday|car|house|health|document|habit|generic",
-  "end_date": "YYYY-MM-DD o null",
-  "advance_days": 0
+  "intent": "create",
+  "data": {
+    "title": "azione da fare, pulita, prima lettera maiuscola",
+    "date": "YYYY-MM-DD o null",
+    "time": "HH:MM o null",
+    "recurrence": "once|daily|weekly|monthly|every_other_day",
+    "recurrence_days": "mon,tue,wed,thu,fri,sat,sun o null",
+    "fire_times": [],
+    "category": "medicine|birthday|car|house|health|document|habit|generic",
+    "end_date": "YYYY-MM-DD o null",
+    "advance_days": 0
+  }
 }
 
-REGOLE IMPORTANTI:
+Per "query":
+{
+  "intent": "query",
+  "data": {
+    "period": "today|tomorrow|week|all|custom",
+    "category": "all|medicine|health|car|...",
+    "search": "termine di ricerca o null"
+  }
+}
 
-1. TITOLO: solo l'azione, senza date/orari/frequenze. "Ricordami di prendere l'antibiotico alle 8" → title="Prendere l'antibiotico"
+Per "delete":
+{
+  "intent": "delete",
+  "data": {
+    "reminder_id": 123,
+    "title_match": "testo per trovare il reminder"
+  }
+}
 
-2. DATE RELATIVE: calcola sempre basandoti sulla data corrente fornita.
-   - "domani" → data corrente + 1 giorno
-   - "dopodomani" → data corrente + 2 giorni
-   - "il prossimo mercoledì" → il prossimo mercoledì futuro
-   - "fra 3 giorni" → data corrente + 3 giorni
-   - "la prossima settimana" → lunedì prossimo
+Per "modify":
+{
+  "intent": "modify",
+  "data": {
+    "reminder_id": 123,
+    "title_match": "testo per trovare il reminder",
+    "new_date": "YYYY-MM-DD o null",
+    "new_time": "HH:MM o null"
+  }
+}
 
-3. ORARI APPROSSIMATIVI:
-   - "verso le 10" → time="10:00"
-   - "mattina presto" → time="07:00"
-   - "a pranzo" → time="13:00"
-   - "nel pomeriggio" → time="15:00"
-   - "stasera" → time="20:00"
-   - "prima di dormire" → time="22:00"
+Per "done":
+{
+  "intent": "done",
+  "data": {
+    "reminder_id": 123,
+    "title_match": "testo per trovare il reminder"
+  }
+}
 
-4. MULTI-ORARIO (fire_times): usalo SOLO quando ci sono più orari distinti nello stesso giorno.
-   - "alle 8, 14 e 21" → fire_times=["08:00","14:00","21:00"], time=null
-   - "alle 9:15 e 14:15" → fire_times=["09:15","14:15"], time=null
-   - Se c'è un solo orario, usa "time" e lascia fire_times=[]
+Per "chat":
+{
+  "intent": "chat",
+  "data": {
+    "response": "risposta breve e amichevole in italiano"
+  }
+}
 
-5. RICORRENZA - ATTENZIONE AI PATTERN ITALIANI:
-   - "ogni giorno" / "tutti i giorni" → recurrence="daily"
-   - "ogni mattina" / "ogni sera" → recurrence="daily"
-   - "ogni lunedì" → recurrence="weekly", recurrence_days="mon"
-   - "ogni lunedì e giovedì" → recurrence="weekly", recurrence_days="mon,thu"
-   - "dal lunedì al venerdì" / "giorni feriali" / "nei giorni lavorativi" → recurrence="weekly", recurrence_days="mon,tue,wed,thu,fri"
-   - "nel weekend" / "il fine settimana" / "sabato e domenica" → recurrence="weekly", recurrence_days="sat,sun"
-   - "a giorni alterni" → recurrence="every_other_day"
-   - "ogni mese" / "il 5 di ogni mese" → recurrence="monthly"
-   - "3 volte a settimana, lun mer ven" → recurrence="weekly", recurrence_days="mon,wed,fri"
-   - Se non c'è indicazione di ricorrenza → recurrence="once"
+REGOLE PER CREATE:
 
-6. DURATA: se l'utente dice "per 7 giorni" o "per 2 settimane":
-   - Calcola end_date = data inizio + durata
+1. TITOLO: solo l'azione, senza date/orari/frequenze.
+2. DATE RELATIVE: calcola basandoti sulla data corrente.
+   - "domani" → +1 giorno, "dopodomani" → +2
+   - "il prossimo mercoledì" → prossimo mercoledì futuro
+   - "la prossima settimana" → prossimo lunedì
+3. ORARI APPROSSIMATIVI: "verso le 10"→10:00, "mattina presto"→07:00, "a pranzo"→13:00, "stasera"→20:00
+4. MULTI-ORARIO: "alle 8, 14 e 21" → fire_times=["08:00","14:00","21:00"], time=null
+5. RICORRENZA:
+   - "ogni giorno"/"tutti i giorni" → daily
+   - "ogni lunedì" → weekly, days="mon"
+   - "dal lunedì al venerdì"/"giorni feriali"/"lavorativi" → weekly, days="mon,tue,wed,thu,fri"
+   - "nel weekend"/"sabato e domenica" → weekly, days="sat,sun"
+   - "a giorni alterni" → every_other_day
+   - "ogni mese"/"il 5 di ogni mese" → monthly
+   - Nessuna indicazione → once
+6. CATEGORIE: medicine(farmaco,pillola,vitamina), health(dentista,medico,visita), car(meccanico,bollo,tagliando,revisione), house(affitto,bolletta,condominio), birthday(compleanno), document(passaporto,patente,730,ISEE), habit(palestra,yoga,corsa), generic(resto)
+7. ADVANCE_DAYS: document=90, car=30, house=5, health=3, birthday=3, altri=0
 
-7. CATEGORIE - deduci dal contesto:
-   - medicine: farmaco, medicina, pillola, pastiglia, integratore, vitamina, antibiotico, compressa
-   - health: dentista, dottore, medico, visita, analisi, esame, oculista, dermatologo
-   - car: meccanico, bollo, tagliando, assicurazione auto, revisione, gomme, officina
-   - house: affitto, bolletta, condominio, luce, gas, acqua, TARI
-   - birthday: compleanno, auguri, festa di
-   - document: carta d'identità, passaporto, patente, documenti, 730, ISEE, rinnovo
-   - habit: palestra, yoga, meditare, camminare, bere acqua, stretching, corsa, allenamento
-   - generic: tutto il resto
+REGOLE PER QUERY:
+- "che ho oggi?"/"cosa devo fare oggi?" → period="today"
+- "domani che programmi ho?" → period="tomorrow"
+- "questa settimana?" → period="week"
+- "ho visite mediche?" → category="health"
+- "quanti reminder ho?" → period="all"
 
-8. ADVANCE_DAYS (anticipo promemoria):
-   - document: 90
-   - car: 30
-   - house: 5
-   - health: 3
-   - birthday: 3
-   - altri: 0
+REGOLE PER DELETE/MODIFY:
+- Usa reminder_id se riesci a identificare il reminder dalla lista fornita
+- Altrimenti usa title_match per cercare per testo
+- "cancella il dentista" → cerca "dentista" nei reminder
+- "sposta la palestra a giovedì" → modify con new_date
+
+REGOLE PER DONE:
+- "fatto il dentista" / "presa la medicina" / "ho fatto la spesa" → trova il reminder e segnalo come fatto
+
+REGOLE PER CHAT:
+- "ciao" / "come stai?" / "grazie" → rispondi in modo amichevole e breve
+- Usa il tono di un assistente simpatico ma conciso
 
 ESEMPI:
 
-Input: "ricordami di prendere l'antibiotico alle 8, 14 e 21 per 7 giorni"
-Output: {"title":"Prendere l'antibiotico","date":"[domani]","time":null,"recurrence":"daily","recurrence_days":null,"fire_times":["08:00","14:00","21:00"],"category":"medicine","end_date":"[domani+7gg]","advance_days":0}
+Input: "domani che devo fare?"
+→ {"intent":"query","data":{"period":"tomorrow","category":"all","search":null}}
 
-Input: "compleanno di Marco il 15 aprile"
-Output: {"title":"Compleanno di Marco","date":"2026-04-15","time":"09:00","recurrence":"once","recurrence_days":null,"fire_times":[],"category":"birthday","end_date":null,"advance_days":3}
+Input: "cancella il reminder del dentista"
+→ {"intent":"delete","data":{"reminder_id":null,"title_match":"dentista"}}
 
-Input: "ogni lunedì e giovedì palestra alle 18:30"
-Output: {"title":"Palestra","date":null,"time":"18:30","recurrence":"weekly","recurrence_days":"mon,thu","fire_times":[],"category":"habit","end_date":null,"advance_days":0}
+Input: "sposta il dentista al 12 marzo"
+→ {"intent":"modify","data":{"reminder_id":null,"title_match":"dentista","new_date":"2026-03-12","new_time":null}}
 
-Input: "dal lunedì al venerdì ore 9:15 e 14:15 avviare la fabbrica di lampadine"
-Output: {"title":"Avviare la fabbrica di lampadine","date":null,"time":null,"recurrence":"weekly","recurrence_days":"mon,tue,wed,thu,fri","fire_times":["09:15","14:15"],"category":"generic","end_date":null,"advance_days":0}
+Input: "domani alle 10 dentista"
+→ {"intent":"create","data":{"title":"Dentista","date":"[domani]","time":"10:00","recurrence":"once","recurrence_days":null,"fire_times":[],"category":"health","end_date":null,"advance_days":0}}
 
-Input: "domani mattina visita dal dentista"
-Output: {"title":"Visita dal dentista","date":"[domani]","time":"09:00","recurrence":"once","recurrence_days":null,"fire_times":[],"category":"health","end_date":null,"advance_days":0}
+Input: "presa la vitamina"
+→ {"intent":"done","data":{"reminder_id":null,"title_match":"vitamina"}}
 
-Input: "pagare l'affitto il 5 di ogni mese"
-Output: {"title":"Pagare l'affitto","date":"[prossimo 5 del mese]","time":"09:00","recurrence":"monthly","recurrence_days":null,"fire_times":[],"category":"house","end_date":null,"advance_days":0}
+Input: "ciao!"
+→ {"intent":"chat","data":{"response":"Ciao! Come posso aiutarti oggi? 😊"}}
 
-Input: "bere 2 litri d'acqua tutti i giorni"
-Output: {"title":"Bere 2 litri d'acqua","date":null,"time":"09:00","recurrence":"daily","recurrence_days":null,"fire_times":[],"category":"habit","end_date":null,"advance_days":0}
+Input: "dal lunedì al venerdì ore 9:15 e 14:15 avviare la fabbrica"
+→ {"intent":"create","data":{"title":"Avviare la fabbrica","date":null,"time":null,"recurrence":"weekly","recurrence_days":"mon,tue,wed,thu,fri","fire_times":["09:15","14:15"],"category":"generic","end_date":null,"advance_days":0}}
 
-Input: "tra 2 ore chiamare il commercialista"
-Output: {"title":"Chiamare il commercialista","date":"[oggi]","time":"[ora+2h]","recurrence":"once","recurrence_days":null,"fire_times":[],"category":"generic","end_date":null,"advance_days":0}
+Input: "ho visite questa settimana?"
+→ {"intent":"query","data":{"period":"week","category":"health","search":null}}
 
-Input: "la prossima settimana portare la macchina a fare il tagliando"
-Output: {"title":"Portare la macchina a fare il tagliando","date":"[prossimo lunedì]","time":"09:00","recurrence":"once","recurrence_days":null,"fire_times":[],"category":"car","end_date":null,"advance_days":0}
-
-Input: "rinnovo passaporto scade il 20 giugno"
-Output: {"title":"Rinnovo passaporto","date":"2026-06-20","time":"09:00","recurrence":"once","recurrence_days":null,"fire_times":[],"category":"document","end_date":null,"advance_days":90}
+Input: "questa settimana ho qualcosa?"
+→ {"intent":"query","data":{"period":"week","category":"all","search":null}}
 """
 
 
 # ─────────────────────────────────────────────
-# Text → Structured Reminder (Llama 3)
+# Intent Classification + Parsing (Llama 3)
 # ─────────────────────────────────────────────
 
-async def parse_with_llm(text: str, user_tz: str = "Europe/Rome") -> Optional[dict]:
+async def classify_and_parse(
+    text: str,
+    user_tz: str = "Europe/Rome",
+    active_reminders: list[dict] | None = None,
+) -> Optional[dict]:
     """
-    Parse a reminder text using Groq LLM via async HTTP.
-    Returns parsed dict or None if LLM is unavailable/fails.
+    Classify user intent and extract structured data.
+    
+    Args:
+        text: user message text
+        user_tz: user timezone
+        active_reminders: list of dicts with id, title, category, next_fire, recurrence
+    
+    Returns:
+        dict with "intent" and "data" keys, or None on failure
     """
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     model = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant").strip()
 
     if not api_key:
-        groq_vars = {k: v[:10] + "..." for k, v in os.environ.items() if "GROQ" in k.upper()}
-        logger.warning(f"GROQ_API_KEY not set or empty. GROQ env vars found: {groq_vars}")
+        logger.warning("GROQ_API_KEY not set, cannot classify intent")
         return None
 
     try:
@@ -149,9 +202,21 @@ async def parse_with_llm(text: str, user_tz: str = "Europe/Rome") -> Optional[di
         day_names = ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"]
         current_day = day_names[now.weekday()]
 
+        # Build reminder context
+        reminders_text = "Nessun reminder attivo."
+        if active_reminders:
+            lines = []
+            for r in active_reminders:
+                lines.append(
+                    f"- ID:{r['id']} | {r['title']} | {r['category']} | "
+                    f"prossimo: {r['next_fire']} | ricorrenza: {r['recurrence']}"
+                )
+            reminders_text = "\n".join(lines)
+
         user_message = (
             f"Data e ora corrente: {current_day} {now.strftime('%d/%m/%Y %H:%M')} "
             f"(fuso: {user_tz})\n\n"
+            f"Reminder attivi dell'utente:\n{reminders_text}\n\n"
             f"Messaggio utente: {text}"
         )
 
@@ -171,12 +236,10 @@ async def parse_with_llm(text: str, user_tz: str = "Europe/Rome") -> Optional[di
             "Content-Type": "application/json",
         }
 
-        logger.info(f"Calling Groq API with model={model} for: {text[:60]}")
+        logger.info(f"LLM classify: '{text[:60]}' with {len(active_reminders or [])} reminders")
 
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(GROQ_CHAT_URL, json=payload, headers=headers)
-
-        logger.info(f"Groq API response status: {response.status_code}")
 
         if response.status_code != 200:
             logger.error(f"Groq API error {response.status_code}: {response.text[:200]}")
@@ -184,28 +247,42 @@ async def parse_with_llm(text: str, user_tz: str = "Europe/Rome") -> Optional[di
 
         data = response.json()
         response_text = data["choices"][0]["message"]["content"].strip()
-        logger.info(f"LLM raw response: {response_text[:300]}")
+        logger.info(f"LLM response: {response_text[:300]}")
 
         parsed = json.loads(response_text)
 
-        if not parsed.get("title"):
-            logger.warning("LLM returned empty title")
+        intent = parsed.get("intent")
+        if not intent:
+            logger.warning("LLM returned no intent")
             return None
 
-        logger.info(f"LLM parsing OK: title='{parsed.get('title')}', "
-                     f"date={parsed.get('date')}, time={parsed.get('time')}, "
-                     f"rec={parsed.get('recurrence')}, days={parsed.get('recurrence_days')}")
+        logger.info(f"LLM intent={intent}")
         return parsed
 
     except httpx.TimeoutException:
-        logger.error("Groq API timeout after 10s")
+        logger.error("Groq API timeout")
         return None
     except json.JSONDecodeError as e:
-        logger.error(f"LLM returned invalid JSON: {e}")
+        logger.error(f"LLM invalid JSON: {e}")
         return None
     except Exception as e:
-        logger.error(f"LLM parsing error: {type(e).__name__}: {e}")
+        logger.error(f"LLM error: {type(e).__name__}: {e}")
         return None
+
+
+# ─────────────────────────────────────────────
+# Legacy: parse only (for fallback / backward compat)
+# ─────────────────────────────────────────────
+
+async def parse_with_llm(text: str, user_tz: str = "Europe/Rome") -> Optional[dict]:
+    """
+    Legacy parser: text → reminder data only.
+    Used as fallback when classify_and_parse is not appropriate.
+    """
+    result = await classify_and_parse(text, user_tz, active_reminders=None)
+    if result and result.get("intent") == "create":
+        return result.get("data")
+    return None
 
 
 # ─────────────────────────────────────────────
@@ -216,10 +293,6 @@ async def transcribe_audio(audio_bytes: bytes, filename: str = "voice.ogg") -> O
     """
     Transcribe audio using Groq Whisper API.
     Returns transcribed text or None if fails.
-    
-    Args:
-        audio_bytes: raw audio file bytes (ogg/opus from Telegram)
-        filename: filename with extension for content-type detection
     """
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     whisper_model = os.environ.get("GROQ_WHISPER_MODEL", "whisper-large-v3").strip()
@@ -235,7 +308,6 @@ async def transcribe_audio(audio_bytes: bytes, filename: str = "voice.ogg") -> O
             "Authorization": f"Bearer {api_key}",
         }
 
-        # Multipart form data for audio upload
         files = {
             "file": (filename, audio_bytes, "audio/ogg"),
         }
@@ -253,10 +325,8 @@ async def transcribe_audio(audio_bytes: bytes, filename: str = "voice.ogg") -> O
                 data=form_data,
             )
 
-        logger.info(f"Whisper API response status: {response.status_code}")
-
         if response.status_code != 200:
-            logger.error(f"Whisper API error {response.status_code}: {response.text[:200]}")
+            logger.error(f"Whisper error {response.status_code}: {response.text[:200]}")
             return None
 
         data = response.json()
@@ -270,8 +340,8 @@ async def transcribe_audio(audio_bytes: bytes, filename: str = "voice.ogg") -> O
         return text
 
     except httpx.TimeoutException:
-        logger.error("Whisper API timeout after 30s")
+        logger.error("Whisper timeout after 30s")
         return None
     except Exception as e:
-        logger.error(f"Whisper transcription error: {type(e).__name__}: {e}")
+        logger.error(f"Whisper error: {type(e).__name__}: {e}")
         return None

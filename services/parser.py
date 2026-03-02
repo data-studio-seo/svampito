@@ -1,7 +1,11 @@
 """
 Natural language parser for Italian reminder input.
-Strategy: try LLM first (Groq/Llama 3), fallback to regex if unavailable.
 Extracts: action, date/time, recurrence, multiple times.
+
+Two parsing modes:
+- parse_reminder(): regex-based (offline, fallback)
+- parse_reminder_async(): LLM-first with regex fallback
+- _llm_dict_to_parsed(): converts LLM JSON dict to ParsedReminder
 """
 import re
 import logging
@@ -48,14 +52,14 @@ class ParsedReminder:
         if self.fire_datetime:
             if self.recurrence == RecurrenceType.ONCE:
                 dt = self.fire_datetime
-                lines.append(f"📅 {dt.strftime('%d/%m/%Y')} ore {dt.strftime('%H:%M')}")
+                lines.append(f"🗓 {dt.strftime('%d/%m/%Y')} ore {dt.strftime('%H:%M')}")
             elif self.recurrence == RecurrenceType.DAILY:
                 if self.fire_times:
                     times_str = " · ".join(self.fire_times)
-                    lines.append(f"📅 Ogni giorno")
+                    lines.append(f"🗓 Ogni giorno")
                     lines.append(f"⏰ {times_str}")
                 else:
-                    lines.append(f"📅 Ogni giorno ore {self.fire_datetime.strftime('%H:%M')}")
+                    lines.append(f"🗓 Ogni giorno ore {self.fire_datetime.strftime('%H:%M')}")
             elif self.recurrence == RecurrenceType.WEEKLY:
                 day_names = {
                     "mon": "lunedì", "tue": "martedì", "wed": "mercoledì",
@@ -63,9 +67,15 @@ class ParsedReminder:
                 }
                 if self.recurrence_days:
                     days = [day_names.get(d, d) for d in self.recurrence_days.split(",")]
-                    lines.append(f"📅 Ogni {', '.join(days)} ore {self.fire_datetime.strftime('%H:%M')}")
+                    time_str = self.fire_datetime.strftime('%H:%M') if self.fire_datetime else ""
+                    if self.fire_times:
+                        times_display = " · ".join(self.fire_times)
+                        lines.append(f"🗓 Ogni {', '.join(days)}")
+                        lines.append(f"⏰ {times_display}")
+                    else:
+                        lines.append(f"🗓 Ogni {', '.join(days)} ore {time_str}")
             elif self.recurrence == RecurrenceType.MONTHLY:
-                lines.append(f"📅 Ogni mese il {self.fire_datetime.day} ore {self.fire_datetime.strftime('%H:%M')}")
+                lines.append(f"🗓 Ogni mese il {self.fire_datetime.day} ore {self.fire_datetime.strftime('%H:%M')}")
 
         # Recurrence label
         if self.recurrence == RecurrenceType.ONCE:
@@ -79,7 +89,11 @@ class ParsedReminder:
         return lines
 
 
-def _llm_dict_to_parsed(data: dict, user_tz: str) -> ParsedReminder:
+# ─────────────────────────────────────────────
+# LLM dict → ParsedReminder
+# ─────────────────────────────────────────────
+
+def _llm_dict_to_parsed(data: dict, user_tz: str = "Europe/Rome") -> ParsedReminder:
     """Convert LLM JSON output to a ParsedReminder object."""
     result = ParsedReminder()
     tz = pytz.timezone(user_tz)
@@ -91,109 +105,106 @@ def _llm_dict_to_parsed(data: dict, user_tz: str) -> ParsedReminder:
         result.title = result.title[0].upper() + result.title[1:]
 
     # Category
-    cat_map = {
-        "medicine": ReminderCategory.MEDICINE,
-        "birthday": ReminderCategory.BIRTHDAY,
-        "car": ReminderCategory.CAR,
-        "house": ReminderCategory.HOUSE,
-        "health": ReminderCategory.HEALTH,
-        "document": ReminderCategory.DOCUMENT,
-        "habit": ReminderCategory.HABIT,
-        "generic": ReminderCategory.GENERIC,
-    }
-    result.category = cat_map.get(data.get("category", "generic"), ReminderCategory.GENERIC)
+    cat_str = data.get("category", "generic")
+    try:
+        result.category = ReminderCategory(cat_str)
+    except ValueError:
+        result.category = ReminderCategory.GENERIC
 
     # Recurrence
-    rec_map = {
-        "once": RecurrenceType.ONCE,
-        "daily": RecurrenceType.DAILY,
-        "weekly": RecurrenceType.WEEKLY,
-        "monthly": RecurrenceType.MONTHLY,
-        "every_other_day": RecurrenceType.EVERY_OTHER_DAY,
-    }
-    result.recurrence = rec_map.get(data.get("recurrence", "once"), RecurrenceType.ONCE)
-    result.recurrence_days = data.get("recurrence_days")
+    rec_str = data.get("recurrence", "once")
+    try:
+        result.recurrence = RecurrenceType(rec_str)
+    except ValueError:
+        result.recurrence = RecurrenceType.ONCE
+
+    result.recurrence_days = data.get("recurrence_days") or None
 
     # Fire times (multi-orario)
-    fire_times = data.get("fire_times", [])
-    if fire_times and isinstance(fire_times, list):
-        result.fire_times = fire_times
+    result.fire_times = data.get("fire_times", []) or []
 
-    # Date and time
+    # Date
     date_str = data.get("date")
     time_str = data.get("time")
 
-    if date_str and time_str:
+    fire_dt = None
+    if date_str:
         try:
-            dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-            result.fire_datetime = tz.localize(dt)
-        except (ValueError, TypeError):
-            pass
-    elif date_str:
+            fire_dt = datetime.strptime(date_str, "%Y-%m-%d")
+            fire_dt = tz.localize(fire_dt)
+        except ValueError:
+            fire_dt = None
+
+    if time_str:
         try:
-            dt = datetime.strptime(date_str, "%Y-%m-%d")
-            dt = dt.replace(hour=9, minute=0)
-            result.fire_datetime = tz.localize(dt)
-        except (ValueError, TypeError):
-            pass
-    elif time_str:
-        try:
-            h, m = map(int, time_str.split(":"))
-            dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
-            if dt <= now:
-                dt += timedelta(days=1)
-            result.fire_datetime = dt
-        except (ValueError, TypeError):
+            parts = time_str.split(":")
+            h, m = int(parts[0]), int(parts[1])
+            if fire_dt:
+                fire_dt = fire_dt.replace(hour=h, minute=m)
+            else:
+                fire_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
+                if fire_dt <= now and result.recurrence == RecurrenceType.ONCE:
+                    fire_dt += timedelta(days=1)
+        except (ValueError, IndexError):
             pass
 
-    # Default if no datetime parsed
-    if not result.fire_datetime:
+    if not fire_dt:
         if result.fire_times:
-            first_time = result.fire_times[0]
-            h, m = map(int, first_time.split(":"))
-            dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
-            if dt <= now:
-                dt += timedelta(days=1)
-            result.fire_datetime = dt
+            # Use first fire_time
+            try:
+                parts = result.fire_times[0].split(":")
+                h, m = int(parts[0]), int(parts[1])
+                fire_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
+                if fire_dt <= now:
+                    fire_dt += timedelta(days=1)
+            except (ValueError, IndexError):
+                fire_dt = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
         else:
-            tomorrow = now + timedelta(days=1)
-            result.fire_datetime = tomorrow.replace(hour=9, minute=0, second=0, microsecond=0)
+            # Default: tomorrow at 9
+            fire_dt = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+
+    result.fire_datetime = fire_dt
 
     # End date
     end_date_str = data.get("end_date")
     if end_date_str:
         try:
-            result.end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
-        except (ValueError, TypeError):
+            ed = datetime.strptime(end_date_str, "%Y-%m-%d")
+            result.end_date = tz.localize(ed)
+        except ValueError:
             pass
 
     # Advance days
-    result.advance_days = data.get("advance_days", 0)
+    result.advance_days = data.get("advance_days", 0) or 0
 
     return result
 
 
+# ─────────────────────────────────────────────
+# Async parser: LLM first, regex fallback
+# ─────────────────────────────────────────────
+
 async def parse_reminder_async(text: str, user_tz: str = "Europe/Rome") -> ParsedReminder:
-    """
-    Parse reminder text: LLM first, regex fallback.
-    This is the async version that tries Groq.
-    """
+    """Parse with LLM first, fallback to regex."""
     try:
         from services.llm import parse_with_llm
         llm_result = await parse_with_llm(text, user_tz)
-
-        if llm_result and llm_result.get("title"):
-            logger.info(f"LLM parsing succeeded for: {text[:50]}")
+        if llm_result:
+            logger.info("Using LLM parser result")
             return _llm_dict_to_parsed(llm_result, user_tz)
     except Exception as e:
-        logger.warning(f"LLM parsing failed, using regex fallback: {e}")
+        logger.error(f"LLM parser failed: {e}")
 
-    # Fallback to regex parser
+    logger.info("Falling back to regex parser")
     return parse_reminder(text, user_tz)
 
 
+# ─────────────────────────────────────────────
+# Regex parser (offline fallback)
+# ─────────────────────────────────────────────
+
 def parse_reminder(text: str, user_tz: str = "Europe/Rome") -> ParsedReminder:
-    """Parse free-text Italian input into a structured reminder (regex-based)."""
+    """Parse free-text Italian input into a structured reminder."""
     result = ParsedReminder()
     tz = pytz.timezone(user_tz)
     now = datetime.now(tz)
@@ -213,7 +224,7 @@ def parse_reminder(text: str, user_tz: str = "Europe/Rome") -> ParsedReminder:
 
     # --- Detect multiple times (e.g., "alle 10, 13, 16 e 19") ---
     multi_time_match = re.search(
-        r"alle?\s+(\d{1,2}(?:[:.]\d{2})?(?:\s*[,e]\s*\d{1,2}(?:[:.]\d{2})?)+)",
+        r"alle?\s+(\d{1,2}(?:[:\.]\d{2})?(?:\s*[,e]\s*\d{1,2}(?:[:\.]\d{2})?)+)",
         cleaned
     )
     if multi_time_match:
@@ -277,7 +288,7 @@ def parse_reminder(text: str, user_tz: str = "Europe/Rome") -> ParsedReminder:
             "PARSERS": ["relative-time", "absolute-time", "custom-formats"],
         }
 
-        time_match = re.search(r"(?:alle?\s+)?(\d{1,2})[:.:](\d{2})", cleaned)
+        time_match = re.search(r"(?:alle?\s+)?(\d{1,2})[:\.:](\d{2})", cleaned)
         single_time_match = re.search(r"alle?\s+(\d{1,2})(?!\d)", cleaned)
 
         parsed_date = dateparser.parse(cleaned, languages=["it"], settings=settings)
@@ -307,10 +318,10 @@ def parse_reminder(text: str, user_tz: str = "Europe/Rome") -> ParsedReminder:
         h, m = map(int, first_time.split(":"))
         result.fire_datetime = result.fire_datetime.replace(hour=h, minute=m, second=0)
 
-    # --- Extract title (the remaining action text) ---
+    # --- Extract title ---
     title = cleaned
     time_fragments = [
-        r"alle?\s+\d{1,2}([:.]\d{2})?",
+        r"alle?\s+\d{1,2}([:\.]\d{2})?",
         r"domani\s*(mattina|pomeriggio|sera)?",
         r"oggi\s*(mattina|pomeriggio|sera)?",
         r"stasera", r"stamattina",
@@ -329,7 +340,7 @@ def parse_reminder(text: str, user_tz: str = "Europe/Rome") -> ParsedReminder:
 
     result.title = title or original
 
-    # --- Detect category from keywords ---
+    # --- Detect category ---
     cat_keywords = {
         ReminderCategory.MEDICINE: ["farmaco", "medicina", "pillola", "pastiglia", "integratore",
                                      "vitamina", "antibiotico", "compressa", "dose"],
