@@ -19,7 +19,9 @@ from handlers.commands import (
     tz_callback, settings_callback,
 )
 from handlers.callbacks import handle_callback, handle_snooze_week
-from handlers.reminders import handle_text, handle_reminder_callback, handle_time_edit
+from handlers.reminders import (
+    handle_text, handle_reminder_callback, handle_time_edit, handle_voice
+)
 from services.scheduler import init_scheduler
 
 # Logging
@@ -70,8 +72,11 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_snooze_week, pattern=r"^snooze_week:"), group=1)
     app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^(done|snooze30|snooze60|tomorrow|skip|cancel):"), group=1)
 
-    # 4. Free text (lowest priority)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router), group=2)
+    # 4. Voice messages
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice), group=2)
+
+    # 5. Free text (lowest priority)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router), group=3)
 
     # --- Post-init: DB + Scheduler ---
     async def post_init(application):
