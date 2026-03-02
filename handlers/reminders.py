@@ -1,8 +1,6 @@
 """
-Handles free-text messages to create reminders.
-Also handles quick confirm responses ("ok", "fatto", "sì").
-Also routes persistent keyboard button presses to the right commands.
-Also handles voice messages (audio → text → reminder).
+Handles free-text messages, voice messages, and reminder callbacks.
+Routes everything through the assistant brain.
 """
 import logging
 from datetime import datetime, timedelta
@@ -15,7 +13,7 @@ from database import (
     async_session, Reminder, ReminderLog, User,
     ReminderStatus, ReminderCategory, RecurrenceType
 )
-from services.parser import parse_reminder, parse_reminder_async, format_confirmation
+from services.parser import parse_reminder, format_confirmation, ParsedReminder
 from services.messages import done_response, get_emoji
 from services.scheduler import reschedule_reminder
 
@@ -36,29 +34,26 @@ KEYBOARD_COMMANDS = {
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle voice messages: transcribe with Whisper, then parse as reminder."""
+    """Handle voice messages: transcribe → process through assistant."""
     voice = update.message.voice
     if not voice:
         return
 
-    # Check duration (skip very long audio, max 60s)
     if voice.duration and voice.duration > 60:
         await update.message.reply_text(
             "🎙️ Audio troppo lungo! Registra un messaggio di massimo 60 secondi."
         )
         return
 
-    # Send "processing" feedback
     processing_msg = await update.message.reply_text("🎙️ Sto ascoltando...")
 
     try:
-        # Download the voice file from Telegram
+        # Download voice file
         voice_file = await voice.get_file()
         audio_bytes = await voice_file.download_as_bytearray()
+        logger.info(f"Voice message: {voice.duration}s, {len(audio_bytes)} bytes")
 
-        logger.info(f"Voice message received: {voice.duration}s, {len(audio_bytes)} bytes")
-
-        # Transcribe with Whisper via Groq
+        # Transcribe with Whisper
         from services.llm import transcribe_audio
         text = await transcribe_audio(bytes(audio_bytes), filename="voice.ogg")
 
@@ -69,11 +64,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Show transcription to user
+        # Show transcription
         await processing_msg.edit_text(f"🎙️ Ho capito: _{text}_", parse_mode="Markdown")
 
-        # Now process the transcribed text as a normal reminder
-        await _process_reminder_text(update, context, text)
+        # Process through assistant
+        await _process_with_assistant(update, context, text)
 
     except Exception as e:
         logger.error(f"Voice handling error: {type(e).__name__}: {e}")
@@ -83,10 +78,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle any text message - keyboard buttons, quick confirm, or new reminder."""
+    """Handle text messages: keyboard buttons, quick confirm, or assistant."""
     text = update.message.text.strip()
 
-    # Check if it's a persistent keyboard button
+    # Check persistent keyboard buttons
     if text in KEYBOARD_COMMANDS:
         from handlers.commands import (
             cmd_oggi, cmd_domani, cmd_settimana,
@@ -104,68 +99,60 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_map[cmd](update, context)
         return
 
-    # Check if it's a quick confirm
+    # Check quick confirm (skip LLM for these)
     if text.lower() in QUICK_CONFIRM:
         await _quick_confirm(update, context)
         return
 
-    # Parse as new reminder
-    await _process_reminder_text(update, context, text)
+    # Process through assistant
+    await _process_with_assistant(update, context, text)
 
 
-async def _process_reminder_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Parse text (from keyboard or voice) and show confirmation."""
-    user_id = update.effective_user.id
+async def _process_with_assistant(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Route message through the assistant brain."""
+    from services.assistant import process_message, AssistantResponse
 
-    # Get user timezone
-    async with async_session() as session:
-        user = await session.get(User, user_id)
-        if not user:
-            user = User(
-                id=user_id,
-                chat_id=update.effective_chat.id,
-                first_name=update.effective_user.first_name,
-            )
-            session.add(user)
-            await session.commit()
+    user = update.effective_user
+    response = await process_message(
+        user_id=user.id,
+        chat_id=update.effective_chat.id,
+        text=text,
+        first_name=user.first_name or "",
+    )
 
-    tz_name = user.timezone if user else "Europe/Rome"
+    # Handle different response types
+    if response.show_confirm and response.pending_reminder:
+        # Store pending reminder for confirmation
+        context.user_data["pending_reminder"] = response.pending_reminder
 
-    # Try LLM parsing first, fallback to regex
-    parsed = await parse_reminder_async(text, tz_name)
-
-    if not parsed.title or len(parsed.title) < 2:
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Conferma", callback_data="rem:confirm"),
+                InlineKeyboardButton("✏️ Modifica ora", callback_data="rem:edit_time"),
+            ],
+            [InlineKeyboardButton("❌ Annulla", callback_data="rem:cancel")],
+        ])
         await update.message.reply_text(
-            "🤔 Non ho capito bene. Prova a scrivere cosa vuoi ricordare, "
-            "ad esempio:\n_\"domani alle 10 chiama il dentista\"_",
-            parse_mode="Markdown"
+            response.text, parse_mode=response.parse_mode, reply_markup=keyboard
         )
-        return
 
-    # Store parsed data for confirmation
-    context.user_data["pending_reminder"] = {
-        "title": parsed.title,
-        "category": parsed.category.value,
-        "fire_datetime": parsed.fire_datetime.isoformat() if parsed.fire_datetime else None,
-        "recurrence": parsed.recurrence.value,
-        "recurrence_days": parsed.recurrence_days,
-        "fire_times": parsed.fire_times,
-        "end_date": parsed.end_date.isoformat() if parsed.end_date else None,
-        "advance_days": parsed.advance_days,
-    }
+    elif response.confirm_delete_id:
+        # Store delete target for confirmation
+        context.user_data["pending_delete"] = response.confirm_delete_id
 
-    # Build confirmation message
-    confirm_text = format_confirmation(parsed)
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Conferma", callback_data=f"cancel:{response.confirm_delete_id}"),
+                InlineKeyboardButton("❌ No", callback_data="rem:cancel_delete"),
+            ],
+        ])
+        await update.message.reply_text(
+            response.text, parse_mode=response.parse_mode, reply_markup=keyboard
+        )
 
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Conferma", callback_data="rem:confirm"),
-            InlineKeyboardButton("✏️ Modifica ora", callback_data="rem:edit_time"),
-        ],
-        [InlineKeyboardButton("❌ Annulla", callback_data="rem:cancel")],
-    ])
-
-    await update.message.reply_text(confirm_text, parse_mode="Markdown", reply_markup=keyboard)
+    else:
+        # Simple text response (query results, chat, done, modify)
+        await update.message.reply_text(response.text, parse_mode=response.parse_mode)
 
 
 async def handle_reminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -175,8 +162,9 @@ async def handle_reminder_callback(update: Update, context: ContextTypes.DEFAULT
 
     action = query.data
 
-    if action == "rem:cancel":
+    if action == "rem:cancel" or action == "rem:cancel_delete":
         context.user_data.pop("pending_reminder", None)
+        context.user_data.pop("pending_delete", None)
         await query.edit_message_text("❌ Annullato.")
         return
 
@@ -192,14 +180,13 @@ async def handle_reminder_callback(update: Update, context: ContextTypes.DEFAULT
         if not pending:
             await query.edit_message_text("⚠️ Nessun reminder da confermare.")
             return
-
         await _save_reminder(query, pending)
 
 
 async def handle_time_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle time edit after user chose 'Modifica ora'."""
     if not context.user_data.get("editing_time"):
-        return False  # Not editing, let normal handler process
+        return False
 
     context.user_data["editing_time"] = False
     text = update.message.text.strip()
@@ -215,8 +202,7 @@ async def handle_time_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = await session.get(User, user_id)
     tz_name = user.timezone if user else "Europe/Rome"
 
-    from services.parser import parse_reminder as pr
-    time_parsed = pr(text, tz_name)
+    time_parsed = parse_reminder(text, tz_name)
 
     if time_parsed.fire_datetime:
         pending["fire_datetime"] = time_parsed.fire_datetime.isoformat()
@@ -226,12 +212,18 @@ async def handle_time_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["pending_reminder"] = pending
 
     # Rebuild confirmation
-    from services.parser import ParsedReminder
     p = ParsedReminder()
     p.title = pending["title"]
-    p.category = ReminderCategory(pending["category"])
+    try:
+        p.category = ReminderCategory(pending["category"])
+    except ValueError:
+        p.category = ReminderCategory.GENERIC
     p.fire_datetime = datetime.fromisoformat(pending["fire_datetime"]) if pending["fire_datetime"] else None
-    p.recurrence = RecurrenceType(pending["recurrence"])
+    try:
+        p.recurrence = RecurrenceType(pending["recurrence"])
+    except ValueError:
+        p.recurrence = RecurrenceType.ONCE
+    p.recurrence_days = pending.get("recurrence_days")
     p.fire_times = pending.get("fire_times", [])
 
     confirm_text = format_confirmation(p)
@@ -271,11 +263,8 @@ async def _save_reminder(query, pending: dict):
             end_date = end_date.astimezone(pytz.UTC).replace(tzinfo=None)
 
         if fire_times and len(fire_times) > 1:
-            # Create multiple reminders for multi-time
             for idx, t in enumerate(fire_times):
                 h, m = map(int, t.split(":"))
-                slot_fire = fire_utc.replace(hour=h, minute=m)
-                # Adjust for UTC offset
                 local_fire = tz.localize(datetime.now(tz).replace(hour=h, minute=m, second=0))
                 slot_fire_utc = local_fire.astimezone(pytz.UTC).replace(tzinfo=None)
                 if slot_fire_utc < datetime.utcnow():
@@ -320,7 +309,6 @@ async def _quick_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     async with async_session() as session:
-        # Find most recent active nudged reminder
         stmt = select(Reminder).where(
             and_(
                 Reminder.user_id == user_id,
