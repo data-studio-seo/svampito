@@ -2,6 +2,7 @@
 Handles free-text messages to create reminders.
 Also handles quick confirm responses ("ok", "fatto", "sì").
 Also routes persistent keyboard button presses to the right commands.
+Also handles voice messages (audio → text → reminder).
 """
 import logging
 from datetime import datetime, timedelta
@@ -34,6 +35,53 @@ KEYBOARD_COMMANDS = {
 }
 
 
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle voice messages: transcribe with Whisper, then parse as reminder."""
+    voice = update.message.voice
+    if not voice:
+        return
+
+    # Check duration (skip very long audio, max 60s)
+    if voice.duration and voice.duration > 60:
+        await update.message.reply_text(
+            "🎙️ Audio troppo lungo! Registra un messaggio di massimo 60 secondi."
+        )
+        return
+
+    # Send "processing" feedback
+    processing_msg = await update.message.reply_text("🎙️ Sto ascoltando...")
+
+    try:
+        # Download the voice file from Telegram
+        voice_file = await voice.get_file()
+        audio_bytes = await voice_file.download_as_bytearray()
+
+        logger.info(f"Voice message received: {voice.duration}s, {len(audio_bytes)} bytes")
+
+        # Transcribe with Whisper via Groq
+        from services.llm import transcribe_audio
+        text = await transcribe_audio(bytes(audio_bytes), filename="voice.ogg")
+
+        if not text:
+            await processing_msg.edit_text(
+                "🎙️ Non sono riuscito a capire l'audio. "
+                "Prova a parlare più chiaramente o scrivimi il reminder."
+            )
+            return
+
+        # Show transcription to user
+        await processing_msg.edit_text(f"🎙️ Ho capito: _{text}_", parse_mode="Markdown")
+
+        # Now process the transcribed text as a normal reminder
+        await _process_reminder_text(update, context, text)
+
+    except Exception as e:
+        logger.error(f"Voice handling error: {type(e).__name__}: {e}")
+        await processing_msg.edit_text(
+            "❌ Errore nell'elaborazione dell'audio. Prova a scrivere il reminder."
+        )
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle any text message - keyboard buttons, quick confirm, or new reminder."""
     text = update.message.text.strip()
@@ -62,13 +110,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Parse as new reminder
+    await _process_reminder_text(update, context, text)
+
+
+async def _process_reminder_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Parse text (from keyboard or voice) and show confirmation."""
     user_id = update.effective_user.id
 
     # Get user timezone
     async with async_session() as session:
         user = await session.get(User, user_id)
         if not user:
-            # Auto-create user
             user = User(
                 id=user_id,
                 chat_id=update.effective_chat.id,
