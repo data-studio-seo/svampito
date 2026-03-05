@@ -10,10 +10,10 @@ import pytz
 
 from database import async_session, Reminder, User, ReminderLog, ReminderStatus, RecurrenceType, ReminderCategory
 from services.messages import (
-    nudge_1, nudge_2, nudge_3, morning_summary, weekly_summary,
+    nudge_1, nudge_quick, nudge_2, nudge_3, morning_summary, weekly_summary,
     get_emoji, snooze_warning
 )
-from config import NUDGE_2_DELAY, NUDGE_3_DELAY, MEDICINE_NUDGE_DELAY, MAX_NUDGES
+from config import NUDGE_1_FOLLOWUP, NUDGE_2_DELAY, NUDGE_3_DELAY, MEDICINE_NUDGE_DELAY, MAX_NUDGES
 
 logger = logging.getLogger(__name__)
 
@@ -134,21 +134,25 @@ async def check_nudges():
             if local_now.hour >= user.sleep_hour or local_now.hour < user.wake_hour:
                 continue
 
-            # Calculate delay based on type
+            # Calculate delay based on nudge count and type
             if reminder.category == ReminderCategory.MEDICINE:
-                delay = MEDICINE_NUDGE_DELAY
+                delay = MEDICINE_NUDGE_DELAY  # 5 min for medicine
             elif reminder.nudge_count == 1:
-                delay = NUDGE_2_DELAY
+                delay = NUDGE_1_FOLLOWUP      # 5 min: first quick followup
+            elif reminder.nudge_count == 2:
+                delay = NUDGE_2_DELAY          # 30 min: second nudge
             else:
-                delay = NUDGE_3_DELAY - NUDGE_2_DELAY
+                delay = NUDGE_3_DELAY - NUDGE_2_DELAY  # remaining time for 3rd
 
             minutes_since = (now_utc - reminder.last_nudge_at).total_seconds() / 60
 
             if minutes_since >= delay:
                 if reminder.nudge_count == 1:
-                    text = nudge_2(reminder)
+                    text = nudge_quick(reminder)  # 5 min gentle followup
+                elif reminder.nudge_count == 2:
+                    text = nudge_2(reminder)       # 30 min nudge
                 else:
-                    text = nudge_3(reminder)
+                    text = nudge_3(reminder)       # last nudge
 
                 keyboard = _get_nudge_keyboard(reminder, reminder.nudge_count + 1)
 
@@ -370,7 +374,28 @@ def _get_nudge_keyboard(reminder: Reminder, nudge_num: int):
 
     rid = reminder.id
 
+    # Nudge 2 = quick 5-min followup (same keyboard as original)
     if nudge_num == 2:
+        if reminder.category == ReminderCategory.MEDICINE:
+            return InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Presa", callback_data=f"done:{rid}"),
+                    InlineKeyboardButton("⏰ Tra 30min", callback_data=f"snooze30:{rid}"),
+                ]
+            ])
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Fatto!", callback_data=f"done:{rid}"),
+                InlineKeyboardButton("⏰ Tra 1h", callback_data=f"snooze60:{rid}"),
+            ],
+            [
+                InlineKeyboardButton("⏰ Domani", callback_data=f"tomorrow:{rid}"),
+                InlineKeyboardButton("❌ Cancella", callback_data=f"cancel:{rid}"),
+            ],
+        ])
+
+    # Nudge 3 = 30-min nudge (more options)
+    if nudge_num == 3:
         if reminder.category == ReminderCategory.MEDICINE:
             return InlineKeyboardMarkup([
                 [
@@ -387,7 +412,7 @@ def _get_nudge_keyboard(reminder: Reminder, nudge_num: int):
             ]
         ])
 
-    # Nudge 3 (last)
+    # Nudge 4 (last)
     if reminder.category == ReminderCategory.MEDICINE:
         return InlineKeyboardMarkup([
             [

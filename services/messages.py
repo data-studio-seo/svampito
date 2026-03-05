@@ -27,7 +27,7 @@ def get_emoji(category: str) -> str:
 # --- Welcome messages ---
 
 WELCOME = (
-    "👋 *Ciao! Sono lo Svampito 👻.*\n\n"
+    "👋 *Ciao! Sono NudgeBot.*\n\n"
     "Ti aiuto a ricordare tutto quello che la tua testa dimentica: "
     "scadenze, appuntamenti, bollette, compleanni, farmaci, abitudini.\n\n"
     "Scrivimi le cose come le diresti a un amico, tipo:\n"
@@ -83,6 +83,7 @@ MEDICINE_ADDED = "✅ Ti ricorderò ogni volta e non mollo finché non confermi 
 # --- Reminder nudges ---
 
 def nudge_1(reminder: Reminder) -> str:
+    """First notification when reminder fires."""
     emoji = get_emoji(reminder.category)
     if reminder.category == ReminderCategory.MEDICINE and reminder.time_slot_total:
         slot = (reminder.time_slot_index or 0) + 1
@@ -94,7 +95,16 @@ def nudge_1(reminder: Reminder) -> str:
     return f"🔔 *{reminder.title}*"
 
 
+def nudge_quick(reminder: Reminder) -> str:
+    """Quick 5-minute gentle followup."""
+    emoji = get_emoji(reminder.category)
+    if reminder.category == ReminderCategory.MEDICINE:
+        return f"{emoji} _{reminder.title.lower()}_ — l'hai presa?"
+    return f"⏳ _{reminder.title.lower()}_ — ci stai pensando?"
+
+
 def nudge_2(reminder: Reminder) -> str:
+    """Second nudge (30 min after first)."""
     emoji = get_emoji(reminder.category)
     if reminder.category == ReminderCategory.MEDICINE:
         return f"{emoji} _Ehi, {reminder.title.lower()}?_"
@@ -102,6 +112,7 @@ def nudge_2(reminder: Reminder) -> str:
 
 
 def nudge_3(reminder: Reminder) -> str:
+    """Third and final nudge."""
     if reminder.category == ReminderCategory.MEDICINE:
         return f"💊 _Ultimo reminder per {reminder.title.lower()}. Saltata?_"
     return f"🫠 _Ultimo nudge per oggi: {reminder.title.lower()}. Lo sposto a domani?_"
@@ -181,5 +192,6 @@ HELP_TEXT = (
     "/impostazioni — Le tue preferenze\n"
     "/export — Esporta i tuoi dati\n"
     "/help — Questa guida\n\n"
-    "Oppure scrivimi qualsiasi cosa da ricordare!"
+    "Oppure scrivimi qualsiasi cosa da ricordare!\n"
+    "Puoi anche inviarmi un messaggio vocale 🎙️"
 )
