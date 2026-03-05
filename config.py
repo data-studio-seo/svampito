@@ -17,7 +17,8 @@ DEFAULT_SLEEP_HOUR = 23
 DEFAULT_TIMEZONE = "Europe/Rome"
 
 # Nudge intervals (minutes)
-NUDGE_2_DELAY = 60      # 1 ora dopo il primo
-NUDGE_3_DELAY = 180     # 3 ore dopo il primo
-MEDICINE_NUDGE_DELAY = 30  # 30 min per farmaci
-MAX_NUDGES = 3
+NUDGE_1_FOLLOWUP = 5       # primo sollecito: 5 min dopo il reminder
+NUDGE_2_DELAY = 30         # secondo sollecito: 30 min dopo il primo
+NUDGE_3_DELAY = 120        # terzo/ultimo: 2 ore dopo il primo
+MEDICINE_NUDGE_DELAY = 5   # farmaci: 5 min (critico!)
+MAX_NUDGES = 4
