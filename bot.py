@@ -1,4 +1,3 @@
-BOT_PY_CODE = '''
 """
 NudgeBot — Il reminder Telegram che non ti molla.
 Main entry point with Mini App integration.
@@ -122,4 +121,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-'''
