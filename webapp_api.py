@@ -507,11 +507,45 @@ async def get_stats(user: dict = Depends(get_current_user)):
 # Serve static frontend
 # ─────────────────────────────────────────────
 
-# Mount static files (React build)
-STATIC_DIR = os.path.join(os.path.dirname(__file__), "webapp", "dist")
-if os.path.exists(STATIC_DIR):
-    app.mount("/assets", StaticFiles(directory=os.path.join(STATIC_DIR, "assets")), name="assets")
+def _find_dist_dir():
+    """Find the webapp/dist directory, trying multiple paths."""
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp", "dist"),
+        os.path.join(os.getcwd(), "webapp", "dist"),
+        "/app/webapp/dist",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            logger.info(f"Found webapp dist at: {path}")
+            return path
+    logger.warning(f"webapp/dist not found. Tried: {candidates}")
+    return None
 
-    @app.get("/")
-    async def serve_index():
-        return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+STATIC_DIR = _find_dist_dir()
+
+if STATIC_DIR:
+    assets_dir = os.path.join(STATIC_DIR, "assets")
+    if os.path.exists(assets_dir):
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+@app.get("/")
+async def serve_index():
+    if STATIC_DIR:
+        index_path = os.path.join(STATIC_DIR, "index.html")
+        if os.path.exists(index_path):
+            return FileResponse(index_path)
+    return {"error": "Frontend not built", "hint": "Run: cd webapp && npm install && npm run build"}
+
+# Catch-all for SPA client-side routing
+@app.get("/{path:path}")
+async def spa_catchall(path: str):
+    if STATIC_DIR:
+        # Try serving the exact file first
+        file_path = os.path.join(STATIC_DIR, path)
+        if os.path.isfile(file_path):
+            return FileResponse(file_path)
+        # Otherwise serve index.html (SPA routing)
+        index_path = os.path.join(STATIC_DIR, "index.html")
+        if os.path.exists(index_path):
+            return FileResponse(index_path)
+    raise HTTPException(status_code=404, detail="Not found")
