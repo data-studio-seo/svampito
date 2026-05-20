@@ -1,13 +1,19 @@
+BOT_PY_CODE = '''
 """
 NudgeBot — Il reminder Telegram che non ti molla.
-Main entry point.
+Main entry point with Mini App integration.
 """
-import logging
 import asyncio
+import logging
+import os
+
+from fastapi import Request
+from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters
 )
+import uvicorn
 
 from config import BOT_TOKEN, PORT, WEBHOOK_URL
 from database import init_db
@@ -23,6 +29,8 @@ from handlers.reminders import (
     handle_text, handle_reminder_callback, handle_time_edit, handle_voice
 )
 from services.scheduler import init_scheduler
+from webapp_api import app as fastapi_app
+from webapp_integration import setup_webapp_button
 
 # Logging
 logging.basicConfig(
@@ -33,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 
 async def text_router(update, context):
-    """Route text messages: check if editing time, otherwise handle as new reminder."""
+    """Route text messages."""
     if context.user_data.get("editing_time"):
         handled = await handle_time_edit(update, context)
         if handled:
@@ -42,63 +50,76 @@ async def text_router(update, context):
 
 
 def main():
-    """Start the bot."""
+    """Start the bot with Mini App API."""
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # --- Handlers (order matters!) ---
-
-    # 1. Onboarding conversation (highest priority)
+    # --- Handlers ---
     app.add_handler(get_onboarding_handler(), group=0)
 
-    # 2. Commands
-    app.add_handler(CommandHandler("oggi", cmd_oggi), group=1)
-    app.add_handler(CommandHandler("domani", cmd_domani), group=1)
-    app.add_handler(CommandHandler("settimana", cmd_settimana), group=1)
-    app.add_handler(CommandHandler("lista", cmd_lista), group=1)
-    app.add_handler(CommandHandler("farmaci", cmd_farmaci), group=1)
-    app.add_handler(CommandHandler("scadenze", cmd_scadenze), group=1)
-    app.add_handler(CommandHandler("fatto", cmd_fatto), group=1)
-    app.add_handler(CommandHandler("cancella", cmd_cancella), group=1)
-    app.add_handler(CommandHandler("silenzio", cmd_silenzio), group=1)
-    app.add_handler(CommandHandler("timezone", cmd_timezone), group=1)
-    app.add_handler(CommandHandler("impostazioni", cmd_impostazioni), group=1)
-    app.add_handler(CommandHandler("export", cmd_export), group=1)
-    app.add_handler(CommandHandler("help", cmd_help), group=1)
+    # Commands
+    for cmd, handler in [
+        ("oggi", cmd_oggi), ("domani", cmd_domani), ("settimana", cmd_settimana),
+        ("lista", cmd_lista), ("farmaci", cmd_farmaci), ("scadenze", cmd_scadenze),
+        ("fatto", cmd_fatto), ("cancella", cmd_cancella), ("silenzio", cmd_silenzio),
+        ("timezone", cmd_timezone), ("impostazioni", cmd_impostazioni),
+        ("export", cmd_export), ("help", cmd_help),
+    ]:
+        app.add_handler(CommandHandler(cmd, handler), group=1)
 
-    # 3. Callback queries
+    # Callbacks
     app.add_handler(CallbackQueryHandler(handle_reminder_callback, pattern=r"^rem:"), group=1)
     app.add_handler(CallbackQueryHandler(tz_callback, pattern=r"^tz:"), group=1)
     app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^settings:"), group=1)
     app.add_handler(CallbackQueryHandler(handle_snooze_week, pattern=r"^snooze_week:"), group=1)
     app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^(done|snooze30|snooze60|tomorrow|skip|cancel):"), group=1)
 
-    # 4. Voice messages
+    # Voice & Text
     app.add_handler(MessageHandler(filters.VOICE, handle_voice), group=2)
-
-    # 5. Free text (lowest priority)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router), group=3)
 
-    # --- Post-init: DB + Scheduler ---
+    # --- Post-init ---
     async def post_init(application):
         await init_db()
         init_scheduler(application.bot)
-        logger.info("Database initialized, scheduler started")
+        await setup_webapp_button(application)
+        logger.info("Database + Scheduler + WebApp button initialized")
 
     app.post_init = post_init
 
     # --- Start ---
     if WEBHOOK_URL:
-        logger.info(f"Starting webhook on port {PORT}")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path="webhook",
-            webhook_url=f"{WEBHOOK_URL}/webhook",
-        )
+        # Combined mode: FastAPI serves API + Telegram webhook
+        logger.info(f"Starting combined FastAPI + Telegram webhook on port {PORT}")
+
+        # Telegram webhook endpoint on FastAPI
+        @fastapi_app.post("/webhook")
+        async def telegram_webhook(request: Request):
+            data = await request.json()
+            update = Update.de_json(data, app.bot)
+            await app.update_queue.put(update)
+            return {"ok": True}
+
+        async def start_combined():
+            # Initialize telegram bot
+            await app.initialize()
+            await app.start()
+            await app.bot.set_webhook(f"{WEBHOOK_URL}/webhook")
+            logger.info(f"Webhook set: {WEBHOOK_URL}/webhook")
+
+            # Run FastAPI with uvicorn
+            config = uvicorn.Config(
+                fastapi_app, host="0.0.0.0", port=PORT,
+                log_level="info",
+            )
+            server = uvicorn.Server(config)
+            await server.serve()
+
+        asyncio.run(start_combined())
     else:
-        logger.info("Starting polling mode")
+        logger.info("Starting polling mode (no Mini App API)")
         app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     main()
+'''
