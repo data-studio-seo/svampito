@@ -32,17 +32,13 @@ class AssistantResponse:
     """What the assistant wants to send back to the user."""
     text: str
     parse_mode: str = "Markdown"
-    # For create intent: pending reminder to confirm
     pending_reminder: Optional[dict] = None
-    # If True, show confirm/edit/cancel buttons
     show_confirm: bool = False
-    # For delete intent: reminder id to confirm deletion
     confirm_delete_id: Optional[int] = None
     confirm_delete_title: Optional[str] = None
 
 
 async def _get_active_reminders(user_id: int, tz) -> list[dict]:
-    """Load active reminders as dicts for LLM context."""
     async with async_session() as session:
         stmt = select(Reminder).where(
             and_(
@@ -68,7 +64,6 @@ async def _get_active_reminders(user_id: int, tz) -> list[dict]:
 
 
 async def _get_reminders_in_range(user_id: int, start_utc: datetime, end_utc: datetime, category: str = "all"):
-    """Get reminders in a time range, optionally filtered by category."""
     async with async_session() as session:
         conditions = [
             Reminder.user_id == user_id,
@@ -85,7 +80,6 @@ async def _get_reminders_in_range(user_id: int, start_utc: datetime, end_utc: da
 
 
 async def _find_reminder_by_match(user_id: int, reminder_id: Optional[int], title_match: Optional[str]):
-    """Find a reminder by ID or title search."""
     async with async_session() as session:
         if reminder_id:
             r = await session.get(Reminder, reminder_id)
@@ -107,28 +101,26 @@ async def _find_reminder_by_match(user_id: int, reminder_id: Optional[int], titl
 
 
 def _format_reminder_line(r: Reminder, tz) -> Optional[str]:
-    """Format a single reminder as a display line."""
     emoji = get_emoji(r.category)
     fire_local = pytz.UTC.localize(r.next_fire).astimezone(tz)
     time_str = fire_local.strftime("%H:%M")
 
     if r.fire_times and r.time_slot_index == 0:
         times = r.fire_times.split(",")
-        return f"{emoji} {r.title} _({' · '.join(times)})_"
+        joiner = " · "
+        return "{} {} _({})_".format(emoji, r.title, joiner.join(times))
     elif r.fire_times and r.time_slot_index and r.time_slot_index > 0:
-        return None  # Skip duplicate time slots
-    return f"{emoji} {r.title} _({time_str})_"
+        return None
+    return "{} {} _({})_".format(emoji, r.title, time_str)
 
 
 def _get_recent_reminder_context(user_id: int) -> Optional[dict]:
-    """Check if there's a recently sent reminder for this user."""
     from services.scheduler import last_sent_reminders
 
     ctx = last_sent_reminders.get(user_id)
     if not ctx:
         return None
 
-    # Check if within context window
     age_minutes = (datetime.utcnow() - ctx["sent_at"]).total_seconds() / 60
     if age_minutes > REPLY_CONTEXT_WINDOW:
         return None
@@ -141,10 +133,6 @@ def _get_recent_reminder_context(user_id: int) -> Optional[dict]:
 # ─────────────────────────────────────────────
 
 async def process_message(user_id: int, chat_id: int, text: str, first_name: str = "") -> AssistantResponse:
-    """
-    Main assistant logic. Takes user text, decides what to do, returns response.
-    """
-    # Get or create user
     async with async_session() as session:
         user = await session.get(User, user_id)
         if not user:
@@ -155,16 +143,11 @@ async def process_message(user_id: int, chat_id: int, text: str, first_name: str
     tz = pytz.timezone(user.timezone if user else "Europe/Rome")
     tz_name = user.timezone if user else "Europe/Rome"
 
-    # Check for recent reminder context
     recent_ctx = _get_recent_reminder_context(user_id)
-
-    # Load active reminders for LLM context
     active_reminders = await _get_active_reminders(user_id, tz)
 
-    # Call LLM to classify intent
     llm_result = await classify_and_parse(text, tz_name, active_reminders, recent_ctx)
 
-    # Fallback: if LLM fails, try to create a reminder with regex parser
     if not llm_result:
         logger.info("LLM unavailable, falling back to regex create")
         return await _handle_create_fallback(text, tz_name)
@@ -172,7 +155,7 @@ async def process_message(user_id: int, chat_id: int, text: str, first_name: str
     intent = llm_result.get("intent", "chat")
     data = llm_result.get("data", {})
 
-    logger.info(f"Processing intent={intent} for user={user_id}")
+    logger.info("Processing intent=%s for user=%s", intent, user_id)
 
     if intent == "create":
         return await _handle_create(data, tz_name)
@@ -187,9 +170,9 @@ async def process_message(user_id: int, chat_id: int, text: str, first_name: str
     elif intent == "reminder_reply":
         return await _handle_reminder_reply(user_id, data, tz_name)
     elif intent == "chat":
-        return AssistantResponse(text=data.get("response", "Ciao! Scrivimi un reminder 😊"))
+        return AssistantResponse(text=data.get("response", "Ciao! Scrivimi un reminder"))
     else:
-        logger.warning(f"Unknown intent: {intent}")
+        logger.warning("Unknown intent: %s", intent)
         return await _handle_create_fallback(text, tz_name)
 
 
@@ -198,18 +181,17 @@ async def process_message(user_id: int, chat_id: int, text: str, first_name: str
 # ─────────────────────────────────────────────
 
 async def _handle_create(data: dict, tz_name: str) -> AssistantResponse:
-    """Handle 'create' intent from LLM."""
     from services.parser import _llm_dict_to_parsed
 
     try:
         parsed = _llm_dict_to_parsed(data, tz_name)
     except Exception as e:
-        logger.error(f"Error converting LLM data to ParsedReminder: {e}")
-        return AssistantResponse(text="❌ Non sono riuscito a creare il reminder. Riprova.")
+        logger.error("Error converting LLM data: %s", e)
+        return AssistantResponse(text="Non sono riuscito a creare il reminder. Riprova.")
 
     if not parsed.title or len(parsed.title) < 2:
         return AssistantResponse(
-            text="🤔 Non ho capito bene. Prova a scrivere cosa vuoi ricordare, "
+            text="Non ho capito bene. Prova a scrivere cosa vuoi ricordare, "
                  "ad esempio:\n_\"domani alle 10 chiama il dentista\"_"
         )
 
@@ -234,12 +216,11 @@ async def _handle_create(data: dict, tz_name: str) -> AssistantResponse:
 
 
 async def _handle_create_fallback(text: str, tz_name: str) -> AssistantResponse:
-    """Fallback create using regex parser."""
     parsed = parse_reminder(text, tz_name)
 
     if not parsed.title or len(parsed.title) < 2:
         return AssistantResponse(
-            text="🤔 Non ho capito bene. Prova a scrivere cosa vuoi ricordare, "
+            text="Non ho capito bene. Prova a scrivere cosa vuoi ricordare, "
                  "ad esempio:\n_\"domani alle 10 chiama il dentista\"_"
         )
 
@@ -264,7 +245,6 @@ async def _handle_create_fallback(text: str, tz_name: str) -> AssistantResponse:
 
 
 async def _handle_query(user_id: int, data: dict, tz) -> AssistantResponse:
-    """Handle 'query' intent: show reminders for a period."""
     period = data.get("period", "today")
     category = data.get("category", "all")
     search = data.get("search")
@@ -282,7 +262,7 @@ async def _handle_query(user_id: int, data: dict, tz) -> AssistantResponse:
         start = now.replace(hour=0, minute=0, second=0)
         end = start + timedelta(days=7)
         label = "Prossimi 7 giorni"
-    else:  # "all" or "custom"
+    else:
         start = now.replace(hour=0, minute=0, second=0)
         end = start + timedelta(days=365)
         label = "Tutti i reminder"
@@ -292,19 +272,20 @@ async def _handle_query(user_id: int, data: dict, tz) -> AssistantResponse:
 
     reminders = await _get_reminders_in_range(user_id, start_utc, end_utc, category)
 
-    # Filter by search term if provided
     if search and reminders:
         search_lower = search.lower()
         reminders = [r for r in reminders if search_lower in r.title.lower()]
 
     if not reminders:
-        cat_label = f" nella categoria {category}" if category != "all" else ""
-        return AssistantResponse(text=f"📋 Niente in programma per *{label.lower()}*{cat_label}!")
+        cat_label = " nella categoria " + category if category != "all" else ""
+        return AssistantResponse(
+            text="Niente in programma per *{}*{}!".format(label.lower(), cat_label)
+        )
 
-    day_names = ["Lunedì", "Martedì", "Mercoledì", "Giovedì", "Venerdì", "Sabato", "Domenica"]
+    day_names = ["Lunedi", "Martedi", "Mercoledi", "Giovedi", "Venerdi", "Sabato", "Domenica"]
 
     if period in ("today", "tomorrow"):
-        lines = [f"📋 *{label}:*\n"]
+        lines = ["*{}:*".format(label)]
         for r in reminders:
             line = _format_reminder_line(r, tz)
             if line:
@@ -312,8 +293,7 @@ async def _handle_query(user_id: int, data: dict, tz) -> AssistantResponse:
         return AssistantResponse(text="\n".join(lines))
 
     else:
-        # Group by day
-        lines = [f"📋 *{label}:*\n"]
+        lines = ["*{}:*".format(label)]
         current_day = None
         for r in reminders:
             fire_local = pytz.UTC.localize(r.next_fire).astimezone(tz)
@@ -321,40 +301,40 @@ async def _handle_query(user_id: int, data: dict, tz) -> AssistantResponse:
             if day_key != current_day:
                 current_day = day_key
                 day_name = day_names[fire_local.weekday()]
-                lines.append(f"\n*{day_name} {fire_local.strftime('%d/%m')}*")
+                lines.append("")
+                lines.append("*{} {}*".format(day_name, fire_local.strftime("%d/%m")))
             line = _format_reminder_line(r, tz)
             if line:
-                lines.append(f"  {line}")
+                lines.append("  " + line)
         return AssistantResponse(text="\n".join(lines))
 
 
 async def _handle_delete(user_id: int, data: dict, tz) -> AssistantResponse:
-    """Handle 'delete' intent: find and confirm deletion."""
     reminder_id = data.get("reminder_id")
     title_match = data.get("title_match")
 
     reminder = await _find_reminder_by_match(user_id, reminder_id, title_match)
 
     if not reminder:
-        return AssistantResponse(
-            text=f"🤔 Non ho trovato nessun reminder"
-                 f"{f' con \"{title_match}\"' if title_match else ''}. "
-                 f"Usa il bottone 📋 per vedere i tuoi reminder."
-        )
+        msg = "Non ho trovato nessun reminder"
+        if title_match:
+            msg += ' con "{}"'.format(title_match)
+        msg += ". Usa il bottone per vedere i tuoi reminder."
+        return AssistantResponse(text=msg)
 
     emoji = get_emoji(reminder.category)
     fire_local = pytz.UTC.localize(reminder.next_fire).astimezone(tz)
 
     return AssistantResponse(
-        text=f"Vuoi cancellare {emoji} *{reminder.title}* "
-             f"({fire_local.strftime('%d/%m/%Y %H:%M')})?",
+        text="Vuoi cancellare {} *{}* ({})?".format(
+            emoji, reminder.title, fire_local.strftime("%d/%m/%Y %H:%M")
+        ),
         confirm_delete_id=reminder.id,
         confirm_delete_title=reminder.title,
     )
 
 
 async def _handle_modify(user_id: int, data: dict, tz) -> AssistantResponse:
-    """Handle 'modify' intent: find and update reminder."""
     reminder_id = data.get("reminder_id")
     title_match = data.get("title_match")
     new_date = data.get("new_date")
@@ -363,17 +343,17 @@ async def _handle_modify(user_id: int, data: dict, tz) -> AssistantResponse:
     reminder = await _find_reminder_by_match(user_id, reminder_id, title_match)
 
     if not reminder:
-        return AssistantResponse(
-            text=f"🤔 Non ho trovato nessun reminder"
-                 f"{f' con \"{title_match}\"' if title_match else ''}."
-        )
+        msg = "Non ho trovato nessun reminder"
+        if title_match:
+            msg += ' con "{}"'.format(title_match)
+        msg += "."
+        return AssistantResponse(text=msg)
 
-    # Apply modifications
     changed = False
     async with async_session() as session:
         r = await session.get(Reminder, reminder.id)
         if not r:
-            return AssistantResponse(text="❌ Errore: reminder non trovato.")
+            return AssistantResponse(text="Errore: reminder non trovato.")
 
         if new_date or new_time:
             old_fire = pytz.UTC.localize(r.next_fire).astimezone(tz)
@@ -403,15 +383,17 @@ async def _handle_modify(user_id: int, data: dict, tz) -> AssistantResponse:
         emoji = get_emoji(reminder.category)
         new_fire_local = pytz.UTC.localize(r.next_fire).astimezone(tz)
         return AssistantResponse(
-            text=f"{emoji} *{reminder.title}* spostato al "
-                 f"{new_fire_local.strftime('%d/%m/%Y')} ore {new_fire_local.strftime('%H:%M')} ✅"
+            text="{} *{}* spostato al {} ore {}".format(
+                emoji, reminder.title,
+                new_fire_local.strftime("%d/%m/%Y"),
+                new_fire_local.strftime("%H:%M")
+            )
         )
     else:
-        return AssistantResponse(text="🤔 Non ho capito cosa modificare. Prova a specificare la nuova data o orario.")
+        return AssistantResponse(text="Non ho capito cosa modificare. Prova a specificare la nuova data o orario.")
 
 
 async def _handle_done(user_id: int, data: dict) -> AssistantResponse:
-    """Handle 'done' intent: mark reminder as completed."""
     from services.scheduler import reschedule_reminder
 
     reminder_id = data.get("reminder_id")
@@ -420,9 +402,7 @@ async def _handle_done(user_id: int, data: dict) -> AssistantResponse:
     reminder = await _find_reminder_by_match(user_id, reminder_id, title_match)
 
     if not reminder:
-        return AssistantResponse(
-            text="🤔 Non ho trovato il reminder da completare."
-        )
+        return AssistantResponse(text="Non ho trovato il reminder da completare.")
 
     async with async_session() as session:
         r = await session.get(Reminder, reminder.id)
@@ -432,20 +412,13 @@ async def _handle_done(user_id: int, data: dict) -> AssistantResponse:
             await reschedule_reminder(r, session)
             await session.commit()
 
-    # Clear context after completing
     from services.scheduler import last_sent_reminders
     last_sent_reminders.pop(user_id, None)
 
-    return AssistantResponse(
-        text=f"✅ *{reminder.title}* — fatto!"
-    )
+    return AssistantResponse(text="*{}* — fatto!".format(reminder.title))
 
 
 async def _handle_reminder_reply(user_id: int, data: dict, tz_name: str) -> AssistantResponse:
-    """
-    Handle contextual reply to a recently sent reminder.
-    Actions: done, snooze (with minutes), skip, tomorrow.
-    """
     from services.scheduler import reschedule_reminder, last_sent_reminders
 
     action = data.get("action", "done")
@@ -453,12 +426,12 @@ async def _handle_reminder_reply(user_id: int, data: dict, tz_name: str) -> Assi
     reminder_id = data.get("reminder_id")
 
     if not reminder_id:
-        return AssistantResponse(text="🤔 Non ho capito a quale reminder ti riferisci.")
+        return AssistantResponse(text="Non ho capito a quale reminder ti riferisci.")
 
     async with async_session() as session:
         reminder = await session.get(Reminder, reminder_id)
         if not reminder or reminder.user_id != user_id:
-            return AssistantResponse(text="⚠️ Reminder non trovato.")
+            return AssistantResponse(text="Reminder non trovato.")
 
         user = await session.get(User, user_id)
         tz = pytz.timezone(user.timezone if user else "Europe/Rome")
@@ -470,7 +443,7 @@ async def _handle_reminder_reply(user_id: int, data: dict, tz_name: str) -> Assi
             await reschedule_reminder(reminder, session)
             await session.commit()
             last_sent_reminders.pop(user_id, None)
-            return AssistantResponse(text=f"✅ *{reminder.title}* — fatto!")
+            return AssistantResponse(text="*{}* — fatto!".format(reminder.title))
 
         elif action == "snooze":
             reminder.next_fire = datetime.utcnow() + timedelta(minutes=snooze_minutes)
@@ -483,11 +456,14 @@ async def _handle_reminder_reply(user_id: int, data: dict, tz_name: str) -> Assi
             last_sent_reminders.pop(user_id, None)
 
             if snooze_minutes >= 60:
-                label = f"{snooze_minutes // 60} ora" if snooze_minutes == 60 else f"{snooze_minutes // 60} ore"
+                if snooze_minutes == 60:
+                    label = "1 ora"
+                else:
+                    label = "{} ore".format(snooze_minutes // 60)
             else:
-                label = f"{snooze_minutes} minuti"
+                label = "{} minuti".format(snooze_minutes)
             return AssistantResponse(
-                text=f"⏰ Ok, ti ricordo {emoji} *{reminder.title}* tra {label}!"
+                text="Ok, ti ricordo {} *{}* tra {}!".format(emoji, reminder.title, label)
             )
 
         elif action == "skip":
@@ -497,14 +473,14 @@ async def _handle_reminder_reply(user_id: int, data: dict, tz_name: str) -> Assi
             await session.commit()
             last_sent_reminders.pop(user_id, None)
 
-            # Show when next fire is if recurring
             if reminder.status == ReminderStatus.ACTIVE and reminder.next_fire:
                 next_local = pytz.UTC.localize(reminder.next_fire).astimezone(tz)
                 return AssistantResponse(
-                    text=f"⏭ {emoji} *{reminder.title}* saltato per oggi. "
-                         f"Prossimo: {next_local.strftime('%d/%m alle %H:%M')}."
+                    text="{} *{}* saltato per oggi. Prossimo: {}.".format(
+                        emoji, reminder.title, next_local.strftime("%d/%m alle %H:%M")
+                    )
                 )
-            return AssistantResponse(text=f"⏭ {emoji} *{reminder.title}* saltato!")
+            return AssistantResponse(text="{} *{}* saltato!".format(emoji, reminder.title))
 
         elif action == "tomorrow":
             current_fire = pytz.UTC.localize(reminder.next_fire).astimezone(tz)
@@ -518,8 +494,10 @@ async def _handle_reminder_reply(user_id: int, data: dict, tz_name: str) -> Assi
             await session.commit()
             last_sent_reminders.pop(user_id, None)
             return AssistantResponse(
-                text=f"📅 {emoji} *{reminder.title}* spostato a domani ({tomorrow.strftime('%H:%M')})."
+                text="{} *{}* spostato a domani ({}).".format(
+                    emoji, reminder.title, tomorrow.strftime("%H:%M")
+                )
             )
 
         else:
-            return AssistantResponse(text="🤔 Non ho capito cosa vuoi fare con questo reminder.")
+            return AssistantResponse(text="Non ho capito cosa vuoi fare con questo reminder.")
