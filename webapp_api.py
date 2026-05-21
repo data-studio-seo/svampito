@@ -57,52 +57,68 @@ app.add_middleware(
 def _validate_init_data(init_data: str) -> dict:
     """
     Validate Telegram Web App initData using HMAC-SHA256.
-    Returns user data if valid, raises HTTPException if not.
+    Follows official Telegram docs exactly:
+    https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
     """
     bot_token = os.environ.get("BOT_TOKEN", "")
     if not bot_token:
         raise HTTPException(status_code=500, detail="BOT_TOKEN not configured")
 
-    # Parse the query string
-    parsed = parse_qs(init_data)
+    # Split raw query string — do NOT use parse_qs (it decodes values)
+    pairs = {}
+    for chunk in init_data.split("&"):
+        if "=" in chunk:
+            key, value = chunk.split("=", 1)
+            pairs[key] = value
 
-    # Extract hash
-    received_hash = parsed.get("hash", [None])[0]
+    received_hash = pairs.pop("hash", None)
     if not received_hash:
+        logger.warning("initData missing hash")
         raise HTTPException(status_code=401, detail="Missing hash")
 
-    # Build data-check-string (sorted, without hash)
-    data_pairs = []
-    for key, values in sorted(parsed.items()):
-        if key != "hash":
-            data_pairs.append(f"{key}={values[0]}")
-    data_check_string = "\n".join(data_pairs)
+    # Build data-check-string: sorted key=value pairs joined by \n
+    # Values must stay URL-encoded exactly as received
+    data_check_string = "\n".join(
+        f"{k}={pairs[k]}" for k in sorted(pairs.keys())
+    )
 
-    # HMAC-SHA256 validation
+    # HMAC-SHA256
     secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
     computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
 
+    logger.info(f"initData validation: hash_match={computed_hash == received_hash}, keys={sorted(pairs.keys())}")
+
     if computed_hash != received_hash:
+        logger.warning(f"Hash mismatch. Received: {received_hash[:16]}... Computed: {computed_hash[:16]}...")
         raise HTTPException(status_code=401, detail="Invalid initData")
 
-    # Extract user info
-    user_json = parsed.get("user", [None])[0]
-    if not user_json:
+    # Extract and decode user info
+    user_raw = pairs.get("user", "")
+    if not user_raw:
         raise HTTPException(status_code=401, detail="No user data")
 
-    return json.loads(unquote(user_json))
+    user_data = json.loads(unquote(user_raw))
+    logger.info(f"Authenticated user: {user_data.get('id')} ({user_data.get('first_name', '')})")
+    return user_data
 
 
 async def get_current_user(x_init_data: str = Header(alias="X-Init-Data", default="")) -> dict:
     """Dependency: extract and validate Telegram user from initData header."""
     if not x_init_data:
+        logger.warning("Missing X-Init-Data header")
         raise HTTPException(status_code=401, detail="Missing X-Init-Data header")
 
     # In development, allow bypass
     if x_init_data == "dev" and os.environ.get("DEBUG"):
         return {"id": 1, "first_name": "Dev"}
 
-    return _validate_init_data(x_init_data)
+    try:
+        return _validate_init_data(x_init_data)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Auth validation error: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=401, detail="Auth validation failed")
 
 
 # ─────────────────────────────────────────────
