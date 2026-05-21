@@ -2,21 +2,31 @@ import { useState, useEffect, useCallback, useMemo } from "react";
 
 // ─── TELEGRAM WEB APP BRIDGE ───
 const tg = typeof window !== "undefined" && window.Telegram?.WebApp;
-const initData = tg?.initData || "";
 const colorScheme = tg?.colorScheme || "light";
 
 const API = "/api";
 
+function getInitData() {
+  // Read fresh each time — Telegram may inject it after page load
+  const w = typeof window !== "undefined" && window.Telegram?.WebApp;
+  return w?.initData || "";
+}
+
 async function api(path, options = {}) {
+  const initData = getInitData();
   const res = await fetch(`${API}${path}`, {
     ...options,
     headers: {
       "Content-Type": "application/json",
-      "X-Init-Data": initData || "dev",
+      "X-Init-Data": initData,
       ...options.headers,
     },
   });
-  if (!res.ok) throw new Error(`API ${res.status}`);
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    console.error(`API error ${res.status}: ${text}`);
+    throw new Error(`API ${res.status}`);
+  }
   return res.json();
 }
 
@@ -61,6 +71,14 @@ export default function SvampitoApp() {
   const [showCreate, setShowCreate] = useState(false);
   const [editId, setEditId] = useState(null);
   const [toast, setToast] = useState("");
+  // Calendar selected day
+  const [selectedDay, setSelectedDay] = useState(null);
+  // Create form fields
+  const [createTitle, setCreateTitle] = useState("");
+  const [createDate, setCreateDate] = useState(new Date().toISOString().split("T")[0]);
+  const [createTime, setCreateTime] = useState("09:00");
+  const [createCategory, setCreateCategory] = useState("generic");
+  const [createRecurrence, setCreateRecurrence] = useState("once");
 
   // Theme
   const theme = dark
@@ -300,7 +318,6 @@ export default function SvampitoApp() {
       else setCalMonth(calMonth + 1);
     };
 
-    const [selectedDay, setSelectedDay] = useState(null);
     const dayReminders = selectedDay ? (calData[selectedDay] || []) : [];
 
     return (
@@ -472,21 +489,20 @@ export default function SvampitoApp() {
 
   // ─── CREATE MODAL ───
   const renderCreateModal = () => {
-    const [title, setTitle] = useState("");
-    const [date, setDate] = useState(new Date().toISOString().split("T")[0]);
-    const [time, setTime] = useState("09:00");
-    const [category, setCategory] = useState("generic");
-    const [recurrence, setRecurrence] = useState("once");
-
     const handleSubmit = async () => {
-      if (!title.trim()) return;
+      if (!createTitle.trim()) return;
       try {
         await api("/reminders", {
           method: "POST",
-          body: JSON.stringify({ title: title.trim(), date, time, category, recurrence }),
+          body: JSON.stringify({ title: createTitle.trim(), date: createDate, time: createTime, category: createCategory, recurrence: createRecurrence }),
         });
         showToast("✅ Creato!");
         setShowCreate(false);
+        setCreateTitle("");
+        setCreateDate(new Date().toISOString().split("T")[0]);
+        setCreateTime("09:00");
+        setCreateCategory("generic");
+        setCreateRecurrence("once");
         loadReminders("all");
       } catch (e) { showToast("❌ Errore nella creazione"); }
     };
@@ -509,7 +525,7 @@ export default function SvampitoApp() {
           </div>
 
           {/* Title */}
-          <input value={title} onChange={(e) => setTitle(e.target.value)}
+          <input value={createTitle} onChange={(e) => setCreateTitle(e.target.value)}
             placeholder="Cosa devi ricordare?"
             style={{
               width: "100%", padding: "14px 16px", borderRadius: 14, fontSize: 16,
@@ -521,14 +537,14 @@ export default function SvampitoApp() {
 
           {/* Date & Time */}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
-            <input type="date" value={date} onChange={(e) => setDate(e.target.value)}
+            <input type="date" value={createDate} onChange={(e) => setCreateDate(e.target.value)}
               style={{
                 padding: "12px 14px", borderRadius: 14, fontSize: 14,
                 border: `2px solid ${theme.border}`, background: theme.input,
                 color: theme.text, outline: "none",
               }}
             />
-            <input type="time" value={time} onChange={(e) => setTime(e.target.value)}
+            <input type="time" value={createTime} onChange={(e) => setCreateTime(e.target.value)}
               style={{
                 padding: "12px 14px", borderRadius: 14, fontSize: 14,
                 border: `2px solid ${theme.border}`, background: theme.input,
@@ -541,9 +557,9 @@ export default function SvampitoApp() {
           <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8, color: theme.muted }}>Categoria</div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 14 }}>
             {CATEGORIES.filter((c) => c.key !== "all").map((c) => (
-              <button key={c.key} onClick={() => setCategory(c.key)}
+              <button key={c.key} onClick={() => setCreateCategory(c.key)}
                 style={{
-                  ...s.catChip(category === c.key),
+                  ...s.catChip(createCategory === c.key),
                   fontSize: 12, padding: "5px 10px",
                 }}>
                 {c.emoji} {c.label}
@@ -555,9 +571,9 @@ export default function SvampitoApp() {
           <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8, color: theme.muted }}>Ricorrenza</div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 20 }}>
             {Object.entries(RECURRENCE_LABELS).map(([key, label]) => (
-              <button key={key} onClick={() => setRecurrence(key)}
+              <button key={key} onClick={() => setCreateRecurrence(key)}
                 style={{
-                  ...s.catChip(recurrence === key),
+                  ...s.catChip(createRecurrence === key),
                   fontSize: 12, padding: "5px 10px",
                 }}>
                 {label}
@@ -571,7 +587,7 @@ export default function SvampitoApp() {
               width: "100%", padding: 16, borderRadius: 16, border: "none",
               background: theme.accent, color: "#fff", fontSize: 16,
               fontWeight: 700, cursor: "pointer",
-              opacity: title.trim() ? 1 : 0.5,
+              opacity: createTitle.trim() ? 1 : 0.5,
             }}>
             Salva reminder
           </button>
